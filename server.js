@@ -21,6 +21,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const DEFAULT_SPEED = voice => voice.startsWith('sopro_') ? 10 : voice === 'kokoro_eu_pt' ? 20 : voice === 'pt_PT-tugao' || voice.startsWith('phoonnx_') ? 100 : 50;
 let lastLive = 0; const running = { job: null, cancelled: new Set() };
 const sessions = new Map(), attempts = new Map();
+// Sessions outlive restarts: they are written to disk (0600) whenever they change.
+const SESSIONS = path.join(DATA, 'sessions.json');
+try { for (const [id, s] of Object.entries(JSON.parse(fs.readFileSync(SESSIONS, 'utf8')))) if (/^[a-f0-9]{64}$/.test(id) && s.expires > Date.now()) sessions.set(id, s); } catch {}
+let sessionTimer; const saveSessions = () => { clearTimeout(sessionTimer); sessionTimer = setTimeout(() => atomic(SESSIONS, Object.fromEntries(sessions)).catch(() => {}), 500); sessionTimer.unref(); };
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const error = (status, message) => Object.assign(new Error(message), { status });
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -214,15 +218,15 @@ async function handle(req,res) {
       if (typeof input.apiKey !== 'string' && (typeof input.username !== 'string' || typeof input.password !== 'string')) throw error(400,'Preenche os dados de acesso.');
       const result=await (await (input.apiKey ? kavita('/api/Plugin/authenticate?apiKey='+encodeURIComponent(input.apiKey)+'&pluginName=Lectoria',null,{method:'POST'}) : kavita('/api/Account/login',null,{method:'POST',body:JSON.stringify({username:input.username,password:input.password})}))).json();
       if (!result.token || result.id == null) throw error(401,'O Kavita não devolveu uma sessão válida.');
-      let expires=Date.now()+12*3600000;
+      let expires=Date.now()+30*86400000; // the Kavita token itself caps this (14 days)
       try { const jwt=JSON.parse(Buffer.from(result.token.split('.')[1],'base64url')); if(jwt.exp) expires=Math.min(expires,jwt.exp*1000); } catch {}
       if (sessions.size >= 200) throw error(503,'Demasiadas sessões abertas. Tenta mais tarde.');
-      const sid=crypto.randomBytes(32).toString('hex'); sessions.set(sid,{userId:result.id,username:result.username,token:result.token,expires});
+      const sid=crypto.randomBytes(32).toString('hex'); sessions.set(sid,{userId:result.id,username:result.username,token:result.token,expires}); saveSessions();
       const secure=req.headers['x-forwarded-proto']==='https' || req.socket.encrypted;
       return send(res,200,{username:result.username},{'Set-Cookie':`lectoria_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.max(1,Math.floor((expires-Date.now())/1000))}${secure?'; Secure':''}`});
     }
     if (route === '/api/logout' && req.method === 'POST') {
-      const sid=(req.headers.cookie||'').match(/lectoria_session=([a-f0-9]{64})/)?.[1]; if(sid)sessions.delete(sid);
+      const sid=(req.headers.cookie||'').match(/lectoria_session=([a-f0-9]{64})/)?.[1]; if(sid){sessions.delete(sid);saveSessions();}
       return send(res,200,{ok:true},{'Set-Cookie':'lectoria_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});
     }
     if (route.startsWith('/api/')) {
@@ -318,6 +322,6 @@ async function handle(req,res) {
     return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
   }catch(e){if(!res.destroyed&&!res.writableEnded)send(res,e.status||500,{error:e.status?e.message:'Ocorreu um problema. Tenta novamente.'});}
 }
-const cleanup=setInterval(()=>{for(const [id,s]of sessions)if(s.expires<Date.now())sessions.delete(id);for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
+const cleanup=setInterval(()=>{let changed=false;for(const [id,s]of sessions)if(s.expires<Date.now()){sessions.delete(id);changed=true;}if(changed)saveSessions();for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
 if(require.main===module) { process.umask(0o077);http.createServer(handle).listen(Number(process.env.PORT)||8104,process.env.HOST||'0.0.0.0',()=>console.log('Lectoria pronta na porta '+(process.env.PORT||8104))); setInterval(()=>tick().catch(()=>{}),10000); }
 module.exports={handle,validateDoc,extract,hash,tick,pcm,wavHeader};
