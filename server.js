@@ -213,7 +213,7 @@ async function handle(req,res) {
     if (route === '/api/login' && req.method === 'POST') {
       const ip=req.socket.remoteAddress; const recent=attempts.get(ip)||{count:0,until:Date.now()+60000};
       if (recent.until < Date.now()) { recent.count=0;recent.until=Date.now()+60000; }
-      if (++recent.count > 10) throw error(429,'Demasiadas tentativas. Aguarda um minuto.'); attempts.set(ip,recent);
+      if (++recent.count > 30) throw error(429,'Demasiadas tentativas. Aguarda um minuto.'); attempts.set(ip,recent);
       const input=await json(req,4000);
       if (typeof input.apiKey !== 'string' && (typeof input.username !== 'string' || typeof input.password !== 'string')) throw error(400,'Preenche os dados de acesso.');
       const result=await (await (input.apiKey ? kavita('/api/Plugin/authenticate?apiKey='+encodeURIComponent(input.apiKey)+'&pluginName=Lectoria',null,{method:'POST'}) : kavita('/api/Account/login',null,{method:'POST',body:JSON.stringify({username:input.username,password:input.password})}))).json();
@@ -221,7 +221,7 @@ async function handle(req,res) {
       let expires=Date.now()+30*86400000; // the Kavita token itself caps this (14 days)
       try { const jwt=JSON.parse(Buffer.from(result.token.split('.')[1],'base64url')); if(jwt.exp) expires=Math.min(expires,jwt.exp*1000); } catch {}
       if (sessions.size >= 200) throw error(503,'Demasiadas sessões abertas. Tenta mais tarde.');
-      const sid=crypto.randomBytes(32).toString('hex'); sessions.set(sid,{userId:result.id,username:result.username,token:result.token,expires}); saveSessions();
+      const sid=crypto.randomBytes(32).toString('hex'); sessions.set(sid,{userId:result.id,username:result.username,token:result.token,apiKey:typeof result.apiKey==='string'?result.apiKey:'',expires}); saveSessions();
       const secure=req.headers['x-forwarded-proto']==='https' || req.socket.encrypted;
       return send(res,200,{username:result.username},{'Set-Cookie':`lectoria_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.max(1,Math.floor((expires-Date.now())/1000))}${secure?'; Secure':''}`});
     }
@@ -240,6 +240,14 @@ async function handle(req,res) {
         const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify(payload),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});
         if(!response.ok)return send(res,response.status,{error:response.status===429?'O motor de voz está ocupado. Tenta novamente dentro de instantes.':'Não foi possível gerar o áudio.'},{...(response.status===429?{'Retry-After':'2'}:{})});
         return send(res,200,await boundedResponse(response,20_000_000),{'Content-Type':'audio/wav'});
+      }
+      if(route==='/api/cover' && req.method==='GET') {
+        // Kavita serves cover thumbnails only against the account's apiKey (returned at login), never the bearer token.
+        if(!session.apiKey)throw error(404,'Capa indisponível.');
+        const series=numeric(url.searchParams.get('series'));
+        let upstream;try{upstream=await fetch(KAVITA+'/api/image/series-cover?seriesId='+series+'&apiKey='+encodeURIComponent(session.apiKey),{signal:AbortSignal.timeout(15000)});}catch{throw error(502,'Capa indisponível.');}
+        const type=upstream.headers.get('content-type')||'';if(!upstream.ok||!type.startsWith('image/'))throw error(404,'Capa indisponível.');
+        return send(res,200,await boundedResponse(upstream,4_000_000),{'Content-Type':type,'Cache-Control':'private, max-age=86400'});
       }
       if(route==='/api/libraries' && req.method==='GET')return send(res,200,await(await kavita('/api/Library/libraries',session)).json());
       if(route==='/api/books' && req.method==='GET') {
