@@ -6,24 +6,41 @@ MAX_TEXT = 2_000_000
 MAX_MEMBER = 30_000_000
 
 class Text(HTMLParser):
+    """Text per block; h1-h3 headings start a new section so an article becomes topics."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.parts, self.skip = [], 0
+        self.parts, self.skip, self.sections, self.heading, self.title = [], 0, [], None, ''
+    def flush(self):
+        text = clean(''.join(self.parts))
+        if text: self.sections.append({'title': self.title or ('Início' if not self.sections else f'Parte {len(self.sections)+1}'), 'text': text})
+        self.parts = []
     def handle_starttag(self, tag, attrs):
         if tag in ('script', 'style', 'head', 'noscript', 'title'): self.skip += 1
-        if tag in ('p', 'br', 'div', 'li', 'h1', 'h2', 'h3', 'section') and not self.skip: self.parts.append('\n')
+        if self.skip: return
+        if tag in ('h1', 'h2', 'h3'): self.flush(); self.heading = []
+        elif tag in ('p', 'br', 'div', 'li', 'section'): self.parts.append('\n')
     def handle_endtag(self, tag):
         if tag in ('script', 'style', 'head', 'noscript', 'title'): self.skip = max(0, self.skip - 1)
-        if tag in ('p', 'div', 'li', 'h1', 'h2', 'h3', 'section') and not self.skip: self.parts.append('\n')
+        if self.skip: return
+        if tag in ('h1', 'h2', 'h3') and self.heading is not None:
+            self.title = ' '.join(''.join(self.heading).split())[:200]; self.heading = None
+        elif tag in ('p', 'div', 'li', 'section'): self.parts.append('\n')
     def handle_data(self, data):
-        if not self.skip: self.parts.append(data)
+        if self.skip: return
+        if self.heading is not None: self.heading.append(data)
+        else: self.parts.append(data)
     def text(self): return clean(''.join(self.parts))
+    def topics(self):
+        self.flush(); return self.sections
 
 def clean(text):
     return '\n\n'.join(' '.join(p.split()) for p in text.replace('\x00', '').splitlines() if p.strip())
 
 def html_text(text):
-    p = Text(); p.feed(text); return p.text()
+    return '\n\n'.join(filter(None, [(s['title'] if s['title'] not in ('Início',) and not s['title'].startswith('Parte ') else '') + '\n\n' + s['text'] for s in html_topics(text)])).strip()
+
+def html_topics(text):
+    p = Text(); p.feed(text); return p.topics()
 
 def safe_zip(file):
     z = zipfile.ZipFile(file)
@@ -82,7 +99,8 @@ def extract(file, name, depth=0):
         source = data.decode('utf-8', errors='replace')
         found = re.search(r'<title[^>]*>(.*?)</title>', source, re.I | re.S)
         title = html_text(found.group(1)).replace('\n', ' ') if found else os.path.splitext(os.path.basename(name))[0]
-        return {'title': title[:300] or 'Artigo', 'sections': [{'title': 'Artigo', 'text': html_text(source)}]}
+        topics = html_topics(source)
+        return {'title': title[:300] or 'Artigo', 'sections': topics if len(topics) > 1 else [{'title': 'Artigo', 'text': html_text(source)}]}
     if ext in ('.txt', '.md'):
         with open(file, 'rb') as f: data = f.read(10_000_001)
         if len(data) > 10_000_000: raise ValueError('Texto demasiado grande.')

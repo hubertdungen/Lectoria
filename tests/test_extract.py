@@ -4,6 +4,11 @@ from extract import extract, html_text, safe_zip
 class Extraction(unittest.TestCase):
  def test_markup_is_text_and_scripts_are_removed(self):
   self.assertEqual(html_text('<p>Olá &amp; mundo.</p><script>alert(1)</script><style>.x{}</style><p>Outra frase.</p>'),'Olá & mundo.\n\nOutra frase.')
+ def test_html_articles_split_into_topics_at_headings(self):
+  from extract import html_topics
+  topics=html_topics('<p>Abertura.</p><h2>Primeiro tema</h2><p>Um.</p><p>Dois.</p><h3>Segundo tema</h3><p>Três.</p>')
+  self.assertEqual([(t['title'],t['text']) for t in topics],[('Início','Abertura.'),('Primeiro tema','Um.\n\nDois.'),('Segundo tema','Três.')])
+  self.assertEqual(html_text('<h1>Capítulo 1</h1><p>Era uma vez.</p>'),'Capítulo 1\n\nEra uma vez.')
  def test_epub_uses_spine_order_not_zip_order(self):
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d)/'sample.epub'
