@@ -15,6 +15,24 @@ const BLOGS = (process.env.LECTORIA_BLOGS ?? 'https://ocosmosracional.blogspot.c
 const CLOUD = process.env.LECTORIA_CLOUD_DIR || '';
 const PYTHON = process.env.LECTORIA_PYTHON ?? 'python3';
 const STATS = path.join(DATA, 'stats.json');
+// Passages synthesised on the host are kept on disk (a `cache/` folder, which the Kopia backup ignores) so a refresh,
+// another device or a later full-audio job never asks the engine for the same text twice. Size-capped, oldest first.
+const CACHE = process.env.LECTORIA_CACHE_DIR || path.join(DATA, 'cache');
+const CACHE_MAX = Number(process.env.LECTORIA_CACHE_MAX_MB || 2000) * 1048576;
+const voiceKey = (text, voice, rate) => hash(voice + '\n' + rate + '\n' + text).slice(0, 40);
+const cacheFile = key => path.join(CACHE, key + '.wav');
+async function readCache(key) { try { const data = await fsp.readFile(cacheFile(key)); const now = new Date(); fsp.utimes(cacheFile(key), now, now).catch(() => {}); return data; } catch { return null; } }
+let lastTrim = 0;
+async function writeCache(key, data) {
+  try { await fsp.mkdir(CACHE, { recursive: true, mode: 0o700 }); const temp = cacheFile(key) + '.' + crypto.randomUUID(); await fsp.writeFile(temp, data, { mode: 0o600 }); await fsp.rename(temp, cacheFile(key)); } catch { return; }
+  if (Date.now() - lastTrim < 60000) return; lastTrim = Date.now();
+  try {
+    const files = []; let total = 0;
+    for (const name of await fsp.readdir(CACHE)) { if (!name.endsWith('.wav')) continue; const stat = await fsp.stat(path.join(CACHE, name)); files.push({ name, mtime: stat.mtimeMs, size: stat.size }); total += stat.size; }
+    if (total <= CACHE_MAX) return;
+    for (const file of files.sort((a, b) => a.mtime - b.mtime)) { if (total <= CACHE_MAX * 0.9) break; await fsp.rm(path.join(CACHE, file.name), { force: true }); total -= file.size; }
+  } catch {}
+}
 const { chunks } = require('./public/chunks.js');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Characters per second before any job has run; replaced by measured speed in stats.json.
@@ -139,12 +157,13 @@ function wavHeader(bytes,rate,channels) { // ponytail: plain RIFF, so a single f
   const h=Buffer.alloc(44); h.write('RIFF',0); h.writeUInt32LE(36+bytes,4); h.write('WAVE',8); h.write('fmt ',12); h.writeUInt32LE(16,16); h.writeUInt16LE(1,20); h.writeUInt16LE(channels,22); h.writeUInt32LE(rate,24); h.writeUInt32LE(rate*channels*2,28); h.writeUInt16LE(channels*2,32); h.writeUInt16LE(16,34); h.write('data',36); h.writeUInt32LE(bytes,40); return h;
 }
 async function synthesizeChunk(text,voice,rate,key) {
+  const cached=await readCache(voiceKey(text,voice,rate)); if(cached)return pcm(cached);
   for(let attempt=0;;attempt++) {
     try {
       const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:AbortSignal.timeout(300000)});
       if(response.status===429) { await sleep(3000); continue; }
       if(!response.ok) throw new Error('synthesis-failed');
-      return pcm(await boundedResponse(response,20_000_000));
+      const wav=await boundedResponse(response,20_000_000); writeCache(voiceKey(text,voice,rate),wav); return pcm(wav);
     } catch(e) { if(attempt>=3) throw e; await sleep(5000); }
   }
 }
@@ -233,13 +252,19 @@ async function handle(req,res) {
       const session=auth(req);
       if(route==='/api/session' && req.method==='GET')return send(res,200,{username:session.username});
       if(route==='/api/voices' && req.method==='GET')return send(res,200,await(await fetch(VOICE+'/api/voice/status',{signal:AbortSignal.timeout(5000)})).json());
+      if(route==='/api/voice/cached' && req.method==='POST') {
+        const input=await json(req,400000);if(!Array.isArray(input.texts)||input.texts.length>1000||input.texts.some(t=>typeof t!=='string'))throw error(400,'Pedido inválido.');
+        return send(res,200,{cached:await Promise.all(input.texts.map(t=>fsp.access(cacheFile(voiceKey(t,String(input.voice),Number(input.rate)))).then(()=>true,()=>false)))});
+      }
       if(route==='/api/voice' && req.method==='POST') {
         const payload=await json(req,16000); const controller=new AbortController(); lastLive=Date.now();
+        const cacheId=typeof payload.text==='string'&&typeof payload.voice==='string'?voiceKey(payload.text,payload.voice,Number(payload.rate)):null;
+        const cached=cacheId&&await readCache(cacheId); if(cached)return send(res,200,cached,{'Content-Type':'audio/wav','X-Lectoria-Cache':'hit'});
         res.on('close',()=> { if(!res.writableEnded)controller.abort(); });
         const key=(await fsp.readFile(KEY,'utf8')).trim();
         const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify(payload),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});
         if(!response.ok)return send(res,response.status,{error:response.status===429?'O motor de voz está ocupado. Tenta novamente dentro de instantes.':'Não foi possível gerar o áudio.'},{...(response.status===429?{'Retry-After':'2'}:{})});
-        return send(res,200,await boundedResponse(response,20_000_000),{'Content-Type':'audio/wav'});
+        const wav=await boundedResponse(response,20_000_000); if(cacheId)writeCache(cacheId,wav); return send(res,200,wav,{'Content-Type':'audio/wav'});
       }
       if(route==='/api/cover' && req.method==='GET') {
         // Kavita serves cover thumbnails only against the account's apiKey (returned at login), never the bearer token.
