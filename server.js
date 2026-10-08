@@ -331,6 +331,9 @@ async function handle(req,res) {
       // Queue and playlists: lists of shelf document ids, one JSON file each, shared by every device of the account.
       const ids=list=>{if(!Array.isArray(list)||list.length>500||list.some(x=>!/^[a-f0-9]{32}$/.test(String(x))))throw error(400,'Lista inválida.');return list;};
       const readJson=async(name,fallback)=>{try{return JSON.parse(await fsp.readFile(path.join(userDir(session),name),'utf8'));}catch{return fallback;}};
+      // User preferences (voice, engine, cache, appearance): small string map, the same on every device.
+      if(route==='/api/settings' && req.method==='GET')return send(res,200,await readJson('settings.json',{}));
+      if(route==='/api/settings' && req.method==='PUT'){const input=await json(req,20000);if(!input||typeof input!=='object'||Array.isArray(input))throw error(400,'Definições inválidas.');const current=await readJson('settings.json',{});for(const [k,v] of Object.entries(input)){if(!/^[a-zA-Z_-]{1,40}$/.test(k)||(typeof v!=='string'&&typeof v!=='number'))throw error(400,'Definições inválidas.');current[k]=String(v).slice(0,200);}if(Object.keys(current).length>60)throw error(400,'Demasiadas definições.');await atomic(path.join(userDir(session),'settings.json'),current);return send(res,200,current);}
       if(route==='/api/queue' && req.method==='GET')return send(res,200,{items:await readJson('queue.json',[])});
       if(route==='/api/queue' && req.method==='PUT'){const items=ids((await json(req,60000)).items);await atomic(path.join(userDir(session),'queue.json'),items);return send(res,200,{items});}
       if(route==='/api/playlists' && req.method==='GET')return send(res,200,await readJson('playlists.json',[]));
