@@ -111,6 +111,12 @@ async function feedJson(url) {
   if(!response.ok) throw error(response.status===404?404:502,response.status===404?'Artigo não encontrado.':'O blogue não respondeu.');
   try { return JSON.parse((await boundedResponse(response,12_000_000)).toString('utf8')); } catch(e) { throw e.status?e:error(502,'O blogue devolveu uma resposta inesperada.'); }
 }
+// Cover for a post: Blogger's thumbnail (enlarged from 72 px) or the first image in the article; the browser loads it directly.
+function postImage(entry) {
+  const thumb=entry['media$thumbnail']?.url; const first=String(entry.content?.$t||'').match(/<img[^>]+src=["']([^"']+)["']/i)?.[1];
+  const url=(thumb||first||'').replace(/&amp;/g,'&'); if(!/^https:\/\//i.test(url)) return null;
+  return url.replace(/\/s72(-c)?\//,'/s400/').slice(0,500);
+}
 const blogTitles=new Map();
 async function blogs() {
   return Promise.all(BLOGS.map(async (url,index)=>{
@@ -302,7 +308,7 @@ async function handle(req,res) {
       if(route==='/api/blog-posts' && req.method==='GET') {
         const blog=blogIndex(url.searchParams.get('blog'));const page=Math.min(1000,Math.max(1,Number(url.searchParams.get('page'))||1));
         const feed=(await feedJson(BLOGS[blog]+'/feeds/posts/default?alt=json&max-results=24&start-index='+((page-1)*24+1))).feed||{};
-        const posts=(feed.entry||[]).map(e=>({id:String(e.id?.$t||'').match(/post-(\d+)$/)?.[1],title:e.title?.$t||'Sem título',published:e.published?.$t||'',url:e.link?.find(l=>l.rel==='alternate')?.href||'',chars:(e.content?.$t||'').replace(/<[^>]+>/g,'').length})).filter(p=>p.id);
+        const posts=(feed.entry||[]).map(e=>({id:String(e.id?.$t||'').match(/post-(\d+)$/)?.[1],title:e.title?.$t||'Sem título',published:e.published?.$t||'',url:e.link?.find(l=>l.rel==='alternate')?.href||'',chars:(e.content?.$t||'').replace(/<[^>]+>/g,'').length,image:postImage(e)})).filter(p=>p.id);
         return send(res,200,{title:feed.title?.$t||BLOGS[blog],total:Number(feed['openSearch$totalResults']?.$t)||posts.length,posts});
       }
       if(route==='/api/import-post' && req.method==='POST') {
@@ -364,7 +370,7 @@ async function handle(req,res) {
     if(!files[route])return send(res,404,{error:'Página não encontrada.'});
     const data=await fsp.readFile(path.join(__dirname,'public',files[route]));
     const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.json':'application/manifest+json'};
-    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
+    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data: https:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
   }catch(e){if(!res.destroyed&&!res.writableEnded)send(res,e.status||500,{error:e.status?e.message:'Ocorreu um problema. Tenta novamente.'});}
 }
 const cleanup=setInterval(()=>{let changed=false;for(const [id,s]of sessions)if(s.expires<Date.now()){sessions.delete(id);changed=true;}if(changed)saveSessions();for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
