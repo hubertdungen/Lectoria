@@ -286,6 +286,18 @@ async function handle(req,res) {
         const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
         const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);return send(res,200,await saveDoc(session,doc));
       }
+      // Queue and playlists: lists of shelf document ids, one JSON file each, shared by every device of the account.
+      const ids=list=>{if(!Array.isArray(list)||list.length>500||list.some(x=>!/^[a-f0-9]{32}$/.test(String(x))))throw error(400,'Lista inválida.');return list;};
+      const readJson=async(name,fallback)=>{try{return JSON.parse(await fsp.readFile(path.join(userDir(session),name),'utf8'));}catch{return fallback;}};
+      if(route==='/api/queue' && req.method==='GET')return send(res,200,{items:await readJson('queue.json',[])});
+      if(route==='/api/queue' && req.method==='PUT'){const items=ids((await json(req,60000)).items);await atomic(path.join(userDir(session),'queue.json'),items);return send(res,200,{items});}
+      if(route==='/api/playlists' && req.method==='GET')return send(res,200,await readJson('playlists.json',[]));
+      if(route==='/api/playlists' && req.method==='POST'){const input=await json(req,60000);const name=String(input.name||'').trim().slice(0,100);if(!name)throw error(400,'Dá um nome à playlist.');const playlists=await readJson('playlists.json',[]);if(playlists.length>=100)throw error(409,'Já tens 100 playlists.');const playlist={id:crypto.randomBytes(16).toString('hex'),name,items:ids(input.items||[]),created:new Date().toISOString()};playlists.push(playlist);await atomic(path.join(userDir(session),'playlists.json'),playlists);return send(res,201,playlist);}
+      const playlistMatch=route.match(/^\/api\/playlists\/([a-f0-9]{32})$/);
+      if(playlistMatch){const playlists=await readJson('playlists.json',[]);const playlist=playlists.find(p=>p.id===playlistMatch[1]);if(!playlist)throw error(404,'Playlist não encontrada.');
+        if(req.method==='PUT'){const input=await json(req,60000);if(input.name!=null){playlist.name=String(input.name).trim().slice(0,100)||playlist.name;}if(input.items!=null)playlist.items=ids(input.items);playlist.updated=new Date().toISOString();await atomic(path.join(userDir(session),'playlists.json'),playlists);return send(res,200,playlist);}
+        if(req.method==='DELETE'){await atomic(path.join(userDir(session),'playlists.json'),playlists.filter(p=>p.id!==playlist.id));return send(res,200,{ok:true});}
+      }
       if(route==='/api/jobs' && req.method==='GET') {
         const st=await stats();const speeds={};for(const v of Object.keys(st))speeds[v]=speed(st,v);
         return send(res,200,{jobs:await listJobs(session),speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD});
