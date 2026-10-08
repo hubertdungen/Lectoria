@@ -269,7 +269,7 @@ async function handle(req,res) {
         return send(res,200,{title:feed.title?.$t||BLOGS[blog],total:Number(feed['openSearch$totalResults']?.$t)||posts.length,posts});
       }
       if(route==='/api/import-post' && req.method==='POST') {
-        const input=await json(req,2000);const blog=blogIndex(input.blog);const post=numeric(input.post);
+        const input=await json(req,2000);const blog=blogIndex(input.blog);const post=String(input.post??'');if(!/^\d{1,30}$/.test(post))throw error(400,'Artigo inválido.'); // Blogger ids exceed 2^53, so they stay strings
         const entry=(await feedJson(BLOGS[blog]+'/feeds/posts/default/'+post+'?alt=json')).entry;if(!entry)throw error(404,'Artigo não encontrado.');
         const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
         const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);return send(res,200,await saveDoc(session,doc));
@@ -311,11 +311,11 @@ async function handle(req,res) {
       return send(res,404,{error:'Pedido não encontrado.'});
     }
     if(!['GET','HEAD'].includes(req.method))return send(res,405,{error:'Método não permitido.'});
-    const files={'/':'index.html','/app.js':'app.js','/chunks.js':'chunks.js','/sw.js':'sw.js','/style.css':'style.css','/icon.svg':'icon.svg','/icon-192.png':'icon-192.png','/icon-512.png':'icon-512.png','/manifest.json':'manifest.json'};
+    const files={'/':'index.html','/app.js':'app.js','/chunks.js':'chunks.js','/sw.js':'sw.js','/local-worker.js':'local-worker.js','/style.css':'style.css','/icon.svg':'icon.svg','/icon-192.png':'icon-192.png','/icon-512.png':'icon-512.png','/manifest.json':'manifest.json'};
     if(!files[route])return send(res,404,{error:'Página não encontrada.'});
     const data=await fsp.readFile(path.join(__dirname,'public',files[route]));
     const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.json':'application/manifest+json'};
-    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
+    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
   }catch(e){if(!res.destroyed&&!res.writableEnded)send(res,e.status||500,{error:e.status?e.message:'Ocorreu um problema. Tenta novamente.'});}
 }
 const cleanup=setInterval(()=>{for(const [id,s]of sessions)if(s.expires<Date.now())sessions.delete(id);for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
