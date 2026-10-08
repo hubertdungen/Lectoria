@@ -41,7 +41,7 @@ let lastLive = 0; const running = { job: null, cancelled: new Set() };
 const sessions = new Map(), attempts = new Map();
 // Sessions outlive restarts: they are written to disk (0600) whenever they change.
 const SESSIONS = path.join(DATA, 'sessions.json');
-try { for (const [id, s] of Object.entries(JSON.parse(fs.readFileSync(SESSIONS, 'utf8')))) if (/^[a-f0-9]{64}$/.test(id) && s.expires > Date.now()) sessions.set(id, s); } catch {}
+try { for (const [id, s] of Object.entries(JSON.parse(fs.readFileSync(SESSIONS, 'utf8')))) if (/^[a-f0-9]{64}$/.test(id) && s.expires > Date.now() && s.apiKey) sessions.set(id, s); } catch {} // sessions without the Kavita api key predate cover support: one fresh login fixes them
 let sessionTimer; const saveSessions = () => { clearTimeout(sessionTimer); sessionTimer = setTimeout(() => atomic(SESSIONS, Object.fromEntries(sessions)).catch(() => {}), 500); sessionTimer.unref(); };
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const error = (status, message) => Object.assign(new Error(message), { status });
