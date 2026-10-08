@@ -75,7 +75,8 @@ const userDir = s => path.join(DATA, 'users', hash(s.userId));
 async function atomic(file, value) { await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 }); const temp = file + '.' + crypto.randomUUID(); await fsp.writeFile(temp, JSON.stringify(value), { mode: 0o600 }); await fsp.rename(temp, file); }
 function validateDoc(doc) {
   if (!doc || !Array.isArray(doc.sections) || !doc.sections.length || doc.sections.length > 5000 || doc.sections.some(s => typeof s.text !== 'string' || typeof s.title !== 'string') || doc.sections.reduce((n,s) => n+s.text.length,0) > 2_000_000 || !doc.sections.some(s => s.text.trim())) throw error(400, 'Documento vazio ou demasiado extenso.');
-  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text })), source: String(doc.source || 'Documento').slice(0,100) };
+  const cover = doc.cover === 'own' ? 'own' : /^https:\/\/\S{1,500}$/.test(String(doc.cover || '')) ? String(doc.cover) : null;
+  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text })), source: String(doc.source || 'Documento').slice(0,100), ...(cover ? { cover } : {}) };
 }
 async function saveDoc(s, doc) {
   doc = validateDoc(doc);
@@ -105,6 +106,12 @@ async function extract(buffer, name) {
     });
   } finally { await fsp.rm(dir, { recursive:true, force:true }); }
 }
+// Covers (uploaded, or copied from Kavita at import): small images under users/<u>/covers, validated by magic bytes.
+const imageType = buf => buf.length>12 && buf[0]===0xff && buf[1]===0xd8 ? 'image/jpeg' : buf.toString('ascii',1,4)==='PNG' ? 'image/png' : buf.toString('ascii',0,4)==='RIFF'&&buf.toString('ascii',8,12)==='WEBP' ? 'image/webp' : null;
+const coverFile = (s, name) => path.join(userDir(s), 'covers', name + '.img');
+async function storeCover(s, name, buf) { const type=imageType(buf); if(!type) throw error(400,'Usa uma imagem JPEG, PNG ou WebP.'); await fsp.mkdir(path.join(userDir(s),'covers'),{recursive:true,mode:0o700}); const temp=coverFile(s,name)+'.'+crypto.randomUUID(); await fsp.writeFile(temp,buf,{mode:0o600}); await fsp.rename(temp,coverFile(s,name)); return type; }
+async function sendCover(res, s, name) { let buf; try { buf=await fsp.readFile(coverFile(s,name)); } catch { throw error(404,'Sem capa.'); } return send(res,200,buf,{'Content-Type':imageType(buf)||'application/octet-stream','Cache-Control':'private, max-age=3600'}); }
+async function kavitaCover(session, series) { if(!session.apiKey||!series) return null; try { const r=await fetch(KAVITA+'/api/image/series-cover?seriesId='+numeric(series)+'&apiKey='+encodeURIComponent(session.apiKey),{signal:AbortSignal.timeout(15000)}); if(!r.ok) return null; const buf=await boundedResponse(r,4_000_000); return imageType(buf)?buf:null; } catch { return null; } }
 function blogIndex(value) { const i=Number(value); if(!Number.isInteger(i)||i<0||i>=BLOGS.length) throw error(400,'Blogue desconhecido.'); return i; }
 async function feedJson(url) {
   let response; try { response=await fetch(url,{signal:AbortSignal.timeout(20000),headers:{Accept:'application/json'}}); } catch { throw error(502,'O blogue não respondeu.'); }
@@ -145,7 +152,7 @@ async function createJob(s,input) {
   const jobs=await listJobs(s); if(jobs.length>=50) throw error(409,'A fila tem 50 áudios. Remove alguns para continuar.');
   const total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { total.chunks++; total.chars+=c.length; }
   if(!total.chunks) throw error(400,'O documento não tem texto para ler.');
-  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id))};
+  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id))};
   await atomic(path.join(jobsDir(s),job.id+'.json'),job); return job;
 }
 function pcm(wav) {
@@ -298,7 +305,7 @@ async function handle(req,res) {
         const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
         const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
         const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));
-        if(input.title)doc.title=String(input.title).slice(0,300); doc.source='Kavita'; return send(res,200,await saveDoc(session,doc));
+        if(input.title)doc.title=String(input.title).slice(0,300); doc.source='Kavita'; const cover=await kavitaCover(session,input.series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return send(res,200,saved);
       }
       if(route==='/api/upload' && req.method==='POST') {
         const name=String(url.searchParams.get('name')||'').slice(0,300);if(!/\.(epub|pdf|docx|txt|md)$/i.test(name))throw error(400,'Usa EPUB, PDF, DOCX, TXT ou Markdown.');
@@ -315,7 +322,7 @@ async function handle(req,res) {
         const input=await json(req,2000);const blog=blogIndex(input.blog);const post=String(input.post??'');if(!/^\d{1,30}$/.test(post))throw error(400,'Artigo inválido.'); // Blogger ids exceed 2^53, so they stay strings
         const entry=(await feedJson(BLOGS[blog]+'/feeds/posts/default/'+post+'?alt=json')).entry;if(!entry)throw error(404,'Artigo não encontrado.');
         const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
-        const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);return send(res,200,await saveDoc(session,doc));
+        const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);const image=postImage(entry);if(image)doc.cover=image;return send(res,200,await saveDoc(session,doc));
       }
       // Queue and playlists: lists of shelf document ids, one JSON file each, shared by every device of the account.
       const ids=list=>{if(!Array.isArray(list)||list.length>500||list.some(x=>!/^[a-f0-9]{32}$/.test(String(x))))throw error(400,'Lista inválida.');return list;};
@@ -327,7 +334,7 @@ async function handle(req,res) {
       const playlistMatch=route.match(/^\/api\/playlists\/([a-f0-9]{32})$/);
       if(playlistMatch){const playlists=await readJson('playlists.json',[]);const playlist=playlists.find(p=>p.id===playlistMatch[1]);if(!playlist)throw error(404,'Playlist não encontrada.');
         if(req.method==='PUT'){const input=await json(req,60000);if(input.name!=null){playlist.name=String(input.name).trim().slice(0,100)||playlist.name;}if(input.items!=null)playlist.items=ids(input.items);playlist.updated=new Date().toISOString();await atomic(path.join(userDir(session),'playlists.json'),playlists);return send(res,200,playlist);}
-        if(req.method==='DELETE'){await atomic(path.join(userDir(session),'playlists.json'),playlists.filter(p=>p.id!==playlist.id));return send(res,200,{ok:true});}
+        if(req.method==='DELETE'){await atomic(path.join(userDir(session),'playlists.json'),playlists.filter(p=>p.id!==playlist.id));await fsp.rm(coverFile(session,'playlist-'+playlist.id),{force:true});return send(res,200,{ok:true});}
       }
       if(route==='/api/jobs' && req.method==='GET') {
         const st=await stats();const speeds={};for(const v of Object.keys(st))speeds[v]=speed(st,v);
@@ -353,15 +360,26 @@ async function handle(req,res) {
       if(route==='/api/documents' && req.method==='POST')return send(res,201,await saveDoc(session,await json(req,12_000_000)));
       if(route==='/api/documents' && req.method==='GET') {
         const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];
-        for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length});}
+        for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,cover:d.cover||null});}
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
+      }
+      const coverMatch=route.match(/^\/api\/(documents|playlists)\/([a-f0-9]{32})\/cover$/);
+      if(coverMatch) {
+        const [,kind,id]=coverMatch; const name=(kind==='playlists'?'playlist-':'')+id;
+        if(req.method==='GET')return await sendCover(res,session,name); // await, so a missing file is caught here instead of crashing the process
+        if(req.method==='POST') {
+          const buf=await body(req,1_500_000);
+          if(kind==='documents'){const file=path.join(userDir(session),id+'.json');let doc;try{doc=JSON.parse(await fsp.readFile(file,'utf8'));}catch{throw error(404,'Documento não encontrado.');}await storeCover(session,name,buf);doc.cover='own';await atomic(file,doc);}
+          else{const playlists=await readJson('playlists.json',[]);const playlist=playlists.find(p=>p.id===id);if(!playlist)throw error(404,'Playlist não encontrada.');await storeCover(session,name,buf);playlist.cover='own';await atomic(path.join(userDir(session),'playlists.json'),playlists);}
+          return send(res,200,{ok:true});
+        }
       }
       const match=route.match(/^\/api\/documents\/([a-f0-9]{32})(\/progress)?$/);
       if(match) {
         const file=path.join(userDir(session),match[1]+(match[2]?'.progress':'')+'.json');
         if(req.method==='GET') { try{return send(res,200,JSON.parse(await fsp.readFile(file,'utf8')));}catch(e){if(match[2]&&e.code==='ENOENT')return send(res,200,{section:0,position:0});throw error(404,'Documento não encontrado.');} }
         if(match[2] && req.method==='PUT') { await fsp.access(path.join(userDir(session),match[1]+'.json')).catch(()=>{throw error(404,'Documento não encontrado.');});const input=await json(req,1000);if(!Number.isInteger(input.section)||input.section<0||!Number.isInteger(input.position)||input.position<0||input.position>2_000_000||input.section>5000)throw error(400,'Posição inválida.');await atomic(file,{section:input.section,position:input.position});return send(res,200,{ok:true}); }
-        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});return send(res,200,{ok:true}); }
+        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});await fsp.rm(coverFile(session,match[1]),{force:true});return send(res,200,{ok:true}); }
       }
       return send(res,404,{error:'Pedido não encontrado.'});
     }
@@ -370,7 +388,7 @@ async function handle(req,res) {
     if(!files[route])return send(res,404,{error:'Página não encontrada.'});
     const data=await fsp.readFile(path.join(__dirname,'public',files[route]));
     const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.json':'application/manifest+json'};
-    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data: https:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
+    return send(res,200,data,{'Content-Type':mime[path.extname(files[route])],'Content-Security-Policy':"default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data: blob: https:; media-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; frame-ancestors 'self'"});
   }catch(e){if(!res.destroyed&&!res.writableEnded)send(res,e.status||500,{error:e.status?e.message:'Ocorreu um problema. Tenta novamente.'});}
 }
 const cleanup=setInterval(()=>{let changed=false;for(const [id,s]of sessions)if(s.expires<Date.now()){sessions.delete(id);changed=true;}if(changed)saveSessions();for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
