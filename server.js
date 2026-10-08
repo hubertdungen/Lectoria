@@ -205,7 +205,11 @@ async function runJob(job,file) {
     await new Promise((resolve,reject)=>out.end(e=>e?reject(e):resolve()));
     await new Promise((resolve,reject)=>{ const wav=fs.createWriteStream(base+'.wav',{mode:0o600}); wav.write(wavHeader(bytes,rate,channels)); fs.createReadStream(base+'.pcm').pipe(wav).on('finish',resolve).on('error',reject); });
     await fsp.rm(base+'.pcm',{force:true}); job.file=job.id+'.wav';
-    if(PYTHON) { const ok=await new Promise(resolve=>{ const child=spawn(PYTHON,[path.join(__dirname,'tomp3.py'),base+'.wav',base+'.mp3'],{stdio:'ignore'}); child.on('error',()=>resolve(false)); child.on('close',code=>resolve(code===0)); });
+    if(PYTHON) {
+      // Tags and cover art for the MP3: the document's own cover file, or the blog image fetched once.
+      let coverPath=''; try { let image=null; if(doc.cover==='own') image=await fsp.readFile(path.join(dir,'..','covers',doc.id+'.img')); else if(/^https:\/\//.test(doc.cover||'')) { const r=await fetch(doc.cover,{signal:AbortSignal.timeout(15000)}); if(r.ok) image=await boundedResponse(r,4_000_000); } if(image&&imageType(image)) { coverPath=base+'.cover'; await fsp.writeFile(coverPath,image,{mode:0o600}); } } catch {}
+      const ok=await new Promise(resolve=>{ const child=spawn(PYTHON,[path.join(__dirname,'tomp3.py'),base+'.wav',base+'.mp3',job.title,'Lectoria · '+job.voiceName.split(' · ')[0],doc.source||'Lectoria',coverPath],{stdio:'ignore'}); child.on('error',()=>resolve(false)); child.on('close',code=>resolve(code===0)); });
+      if(coverPath)await fsp.rm(coverPath,{force:true});
       if(ok) { await fsp.rm(base+'.wav',{force:true}); job.file=job.id+'.mp3'; } else await fsp.rm(base+'.mp3',{force:true}); }
     job.seconds=Math.round(bytes/(rate*channels*2));
     if(job.destination==='cloud') { await fsp.mkdir(CLOUD,{recursive:true}); const target=path.join(CLOUD,safeName(job.title)+' · '+safeName(job.voiceName.split(' · ')[0])+path.extname(job.file)); await fsp.copyFile(path.join(dir,job.file),target); job.cloudPath=target; }
