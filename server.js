@@ -36,7 +36,7 @@ async function writeCache(key, data) {
 const { chunks } = require('./public/chunks.js');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Characters per second before any job has run; replaced by measured speed in stats.json.
-const DEFAULT_SPEED = voice => voice.startsWith('sopro_') ? 10 : voice === 'kokoro_eu_pt' ? 20 : voice === 'pt_PT-tugao' || voice.startsWith('phoonnx_') ? 100 : 50;
+const DEFAULT_SPEED = voice => voice.startsWith('sopro_') ? 10 : voice === 'kokoro_eu_pt' ? 20 : voice.startsWith('pt_PT-') || voice.startsWith('phoonnx_') ? 100 : 50;
 let lastLive = 0; const running = { job: null, cancelled: new Set() };
 const sessions = new Map(), attempts = new Map();
 // Sessions outlive restarts: they are written to disk (0600) whenever they change.
