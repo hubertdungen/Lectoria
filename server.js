@@ -62,7 +62,7 @@ async function json(req, limit = 6_000_000) {
 }
 async function kavita(route, session, options = {}) {
   const response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: AbortSignal.timeout(120000) });
-  if (!response.ok) throw error(response.status === 401 || response.status === 403 ? 401 : 502, response.status === 401 || response.status === 403 ? 'Volta a entrar no Kavita para continuar.' : 'O Kavita não conseguiu responder a este pedido.');
+  if (!response.ok) { const detail = await response.text().catch(() => ''); throw error(response.status === 401 || response.status === 403 ? 401 : 502, response.status === 401 || response.status === 403 ? 'Volta a entrar no Kavita para continuar.' : /input\/output|not found|no such file/i.test(detail) ? 'O Kavita não consegue ler o ficheiro deste livro no disco (erro de disco ou ficheiro em falta). Verifica a montagem do disco de media.' : 'O Kavita não conseguiu responder a este pedido.'); }
   return response;
 }
 function auth(req) {
@@ -160,6 +160,7 @@ async function createJob(s,input) {
   if(input.destination==='cloud'&&!CLOUD) throw error(400,'Não há pasta de destino configurada neste servidor.');
   let startAt=Date.now(); if(input.startAt!=null) { startAt=Date.parse(input.startAt); if(!Number.isFinite(startAt)||startAt>Date.now()+366*86400000) throw error(400,'Data de início inválida.'); }
   const jobs=await listJobs(s); if(jobs.length>=50) throw error(409,'A fila tem 50 áudios. Remove alguns para continuar.');
+  const twin=jobs.find(j=>j.title.trim().toLowerCase()===doc.title.trim().toLowerCase()&&j.voice===voice.id&&j.rate===rate&&['queued','running','cancelling','done'].includes(j.status)); if(twin&&!input.force) throw error(409,twin.status==='done'?'Já existe este áudio com esta voz e velocidade. Remove-o em Áudios se quiseres gerar outro.':'Este áudio já está na fila com esta voz e velocidade.');
   const total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { total.chunks++; total.chars+=c.length; }
   if(!total.chunks) throw error(400,'O documento não tem texto para ler.');
   const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id))};
@@ -226,7 +227,7 @@ async function runJob(job,file) {
     job.status='done'; job.finished=new Date().toISOString(); job.eta=0;
   } catch(e) {
     out.destroy(); await fsp.rm(base+'.pcm',{force:true});
-    job.status=e.message==='cancelled'?'cancelled':'error'; job.error=e.message==='cancelled'?'':e.message==='synthesis-failed'?'O motor de voz falhou a meio. Tenta novamente.':e.message; job.finished=new Date().toISOString();
+    job.status=e.message==='cancelled'||job.status==='cancelling'?'cancelled':'error'; job.error=e.message==='cancelled'?'':e.message==='synthesis-failed'?'O motor de voz falhou a meio. Tenta novamente.':e.message; job.finished=new Date().toISOString();
   }
   await atomic(file,job);
 }
@@ -373,7 +374,7 @@ async function handle(req,res) {
           return fs.createReadStream(audio).pipe(res);
         }
         if(!jobMatch[2] && req.method==='DELETE') {
-          if(running.job?.id===job.id){running.cancelled.add(job.id);return send(res,200,{ok:true,cancelling:true});}
+          if(running.job?.id===job.id){running.cancelled.add(job.id);running.job.status='cancelling';await atomic(file,running.job).catch(()=>{});return send(res,200,{ok:true,cancelling:true});}
           for(const name of [jobMatch[1]+'.json',jobMatch[1]+'.pcm',jobMatch[1]+'.wav',jobMatch[1]+'.mp3'])await fsp.rm(path.join(userDir(session),'jobs',name),{force:true});
           return send(res,200,{ok:true});
         }
