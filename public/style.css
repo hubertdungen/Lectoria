@@ -52,10 +52,10 @@ body.menu-open .main-shell::after{content:"";position:fixed;inset:0;background:#
 /* Passage states: ready (cached), loading (being synthesised: slow diagonal stripes), active (playing) */
 #reader-text p{transition:background .3s,border-color .3s,box-shadow .3s}
 #reader-text p.ready{background:color-mix(in srgb,var(--accent) 7%,transparent);border-left-color:color-mix(in srgb,var(--accent) 40%,transparent)}
-#reader-text p.loading{background-color:color-mix(in srgb,var(--accent) 5%,transparent);background-image:repeating-linear-gradient(135deg,transparent 0 11px,var(--stripe) 11px 22px);background-size:31.1127px 31.1127px;animation:stripes 2.4s linear infinite;border-left-color:color-mix(in srgb,var(--accent) 55%,transparent)}
+#reader-text p.loading{background-color:color-mix(in srgb,var(--accent) 5%,transparent);background-image:repeating-linear-gradient(135deg,transparent 0 25%,var(--stripe) 25% 50%);background-size:28px 28px;animation:stripes 2.2s linear infinite;border-left-color:color-mix(in srgb,var(--accent) 55%,transparent)}
 #reader-text p.active{background-color:color-mix(in srgb,var(--accent) 18%,transparent);border-left:3px solid var(--accent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 35%,transparent)}
-#reader-text p.active.loading{background-image:repeating-linear-gradient(135deg,transparent 0 11px,var(--stripe) 11px 22px)}
-@keyframes stripes{to{background-position:31.1127px 0}}
+#reader-text p.active.loading{background-image:repeating-linear-gradient(135deg,transparent 0 25%,var(--stripe) 25% 50%)}
+@keyframes stripes{to{background-position:28px 0}}
 #reader-text p{position:relative}#reader-text p.loading::after{content:attr(data-eta);position:absolute;right:10px;top:5px;font:11px/1 system-ui,sans-serif;color:var(--muted);font-variant-numeric:tabular-nums;letter-spacing:.5px;opacity:.85}
 /* Reading mode hides the sidebar in the reader (desktop focus); on phones the hamburger must still open it. */
 @media(max-width:800px){body.mode-reading.menu-open:has(#reader-view:not([hidden])) .sidebar{display:flex}}
