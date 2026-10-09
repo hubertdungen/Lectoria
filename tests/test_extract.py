@@ -9,6 +9,12 @@ class Extraction(unittest.TestCase):
   topics=html_topics('<p>Abertura.</p><h2>Primeiro tema</h2><p>Um.</p><p>Dois.</p><h3>Segundo tema</h3><p>Três.</p>')
   self.assertEqual([(t['title'],t['text']) for t in topics],[('Início','Abertura.'),('Primeiro tema','Um.\n\nDois.'),('Segundo tema','Três.')])
   self.assertEqual(html_text('<h1>Capítulo 1</h1><p>Era uma vez.</p>'),'Capítulo 1\n\nEra uma vez.')
+ def test_wrapped_lines_inside_paragraphs_do_not_split_them(self):
+  self.assertEqual(html_text('<p>A Europa, com a sua rica génese, foi\nsempre um terreno\r\nfértil.</p><p>Outro<br>parágrafo.</p><h2>Título<o:p></o:p></h2><p>Fim.</p>'),'A Europa, com a sua rica génese, foi sempre um terreno fértil.\n\nOutro\n\nparágrafo.\n\nTítulo\n\nFim.')
+ def test_html_article_is_a_single_section(self):
+  with tempfile.TemporaryDirectory() as d:
+   p=pathlib.Path(d)/'post.html'; p.write_text('<title>Art</title><p>Intro.</p><h2>Um</h2><p>Texto um.</p><h3>Dois</h3><p>Texto dois.</p>',encoding='utf-8')
+   doc=extract(str(p),'post.html'); self.assertEqual(doc['title'],'Art'); self.assertEqual(len(doc['sections']),1); self.assertEqual(doc['sections'][0]['text'],'Intro.\n\nUm\n\nTexto um.\n\nDois\n\nTexto dois.')
  def test_epub_uses_spine_order_not_zip_order(self):
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d)/'sample.epub'

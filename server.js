@@ -18,7 +18,7 @@ const STATS = path.join(DATA, 'stats.json');
 // Passages synthesised on the host are kept on disk (a `cache/` folder, which the Kopia backup ignores) so a refresh,
 // another device or a later full-audio job never asks the engine for the same text twice. Size-capped, oldest first.
 const CACHE = process.env.LECTORIA_CACHE_DIR || path.join(DATA, 'cache');
-const CACHE_MAX = Number(process.env.LECTORIA_CACHE_MAX_MB || 2000) * 1048576;
+const CACHE_MAX = Number(process.env.LECTORIA_CACHE_MAX_MB || 6000) * 1048576;
 const voiceKey = (text, voice, rate) => hash(voice + '\n' + rate + '\n' + text).slice(0, 40);
 const cacheFile = key => path.join(CACHE, key + '.wav');
 async function readCache(key) { try { const data = await fsp.readFile(cacheFile(key)); const now = new Date(); fsp.utimes(cacheFile(key), now, now).catch(() => {}); return data; } catch { return null; } }

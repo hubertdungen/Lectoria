@@ -27,6 +27,8 @@ class Text(HTMLParser):
         elif tag in ('p', 'div', 'li', 'section'): self.parts.append('\n')
     def handle_data(self, data):
         if self.skip: return
+        # Newlines inside HTML text are just whitespace (Word/EPUB wrap lines); only block tags end a paragraph.
+        data = data.replace('\r', ' ').replace('\n', ' ')
         if self.heading is not None: self.heading.append(data)
         else: self.parts.append(data)
     def text(self): return clean(''.join(self.parts))
@@ -99,8 +101,8 @@ def extract(file, name, depth=0):
         source = data.decode('utf-8', errors='replace')
         found = re.search(r'<title[^>]*>(.*?)</title>', source, re.I | re.S)
         title = html_text(found.group(1)).replace('\n', ' ') if found else os.path.splitext(os.path.basename(name))[0]
-        topics = html_topics(source)
-        return {'title': title[:300] or 'Artigo', 'sections': topics if len(topics) > 1 else [{'title': 'Artigo', 'text': html_text(source)}]}
+        # One section per article: headings stay in the text as their own paragraphs, so the whole piece reads top to bottom.
+        return {'title': title[:300] or 'Artigo', 'sections': [{'title': 'Artigo', 'text': html_text(source)}]}
     if ext in ('.txt', '.md'):
         with open(file, 'rb') as f: data = f.read(10_000_001)
         if len(data) > 10_000_000: raise ValueError('Texto demasiado grande.')
