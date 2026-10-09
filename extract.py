@@ -47,8 +47,8 @@ def html_topics(text):
 def safe_zip(file):
     z = zipfile.ZipFile(file)
     members = z.infolist()
-    if len(members) > 5000 or sum(x.file_size for x in members) > 200_000_000: raise ValueError('Arquivo demasiado grande.')
-    if any(x.file_size > MAX_MEMBER or x.file_size > max(1, x.compress_size) * 1000 for x in members): raise ValueError('Arquivo comprimido demasiado grande.')
+    if len(members) > 5000 or sum(x.file_size for x in members) > 200_000_000: raise ValueError('Ficheiro comprimido demasiado grande.')
+    if any(x.file_size > MAX_MEMBER or x.file_size > max(1, x.compress_size) * 1000 for x in members): raise ValueError('Ficheiro comprimido expande demasiado.')
     return z
 
 def epub(z):
@@ -87,7 +87,7 @@ def extract(file, name, depth=0):
                 root = ET.fromstring(z.read('word/document.xml'))
                 text = '\n'.join(''.join(x.text or '' for x in p.iter() if x.tag.endswith('}t')) for p in root.iter() if p.tag.endswith('}p'))
                 return {'title': os.path.splitext(os.path.basename(name))[0], 'sections': [{'title': 'Documento', 'text': clean(text)}]}
-            if depth: raise ValueError('Formato de arquivo não suportado.')
+            if depth: raise ValueError('Formato de ficheiro não suportado.')
             supported = [x for x in z.namelist() if os.path.splitext(x.lower())[1] in ('.epub', '.pdf', '.docx', '.txt') and not x.startswith('__MACOSX/')]
             if not supported: raise ValueError('O livro não contém EPUB, PDF, DOCX ou TXT legível.')
             import tempfile

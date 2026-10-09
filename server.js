@@ -140,6 +140,16 @@ async function listJobs(s) {
   for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) { try { jobs.push(JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'))); } catch {} }
   return jobs.sort((a,b)=>b.created.localeCompare(a.created));
 }
+// Partial recording: how many passages of a document already sit in the disk cache for a voice and speed.
+async function coverage(doc,voice,rate){let done=0,total=0;for(const section of doc.sections)for(const text of chunks(section.text)){total++;if(await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false))done++;}return {done,total};}
+async function autoCompile(s,docId,voice,rate){
+  try{
+    const settings=JSON.parse(await fsp.readFile(path.join(userDir(s),'settings.json'),'utf8').catch(()=>'{}'));if(settings.partialRecording!=='1')return;
+    const doc=JSON.parse(await fsp.readFile(path.join(userDir(s),docId+'.json'),'utf8'));const c=await coverage(doc,voice,rate);if(c.done<c.total)return;
+    if((await listJobs(s)).some(j=>j.doc===docId&&j.voice===voice&&j.rate===rate&&['queued','running','done'].includes(j.status)))return;
+    await createJob(s,{doc:docId,voice,rate,destination:settings.cloudCopy==='1'&&CLOUD?'cloud':'download'});
+  }catch{}
+}
 async function createJob(s,input) {
   if(!/^[a-f0-9]{32}$/.test(String(input.doc||''))) throw error(400,'Documento inválido.');
   let doc; try { doc=JSON.parse(await fsp.readFile(path.join(userDir(s),input.doc+'.json'),'utf8')); } catch { throw error(404,'Documento não encontrado.'); }
@@ -274,14 +284,15 @@ async function handle(req,res) {
         return send(res,200,{cached:await Promise.all(input.texts.map(t=>fsp.access(cacheFile(voiceKey(t,String(input.voice),Number(input.rate)))).then(()=>true,()=>false)))});
       }
       if(route==='/api/voice' && req.method==='POST') {
-        const payload=await json(req,16000); const controller=new AbortController(); lastLive=Date.now();
+        const payload=await json(req,16000); const controller=new AbortController();
         const cacheId=typeof payload.text==='string'&&typeof payload.voice==='string'?voiceKey(payload.text,payload.voice,Number(payload.rate)):null;
         const cached=cacheId&&await readCache(cacheId); if(cached)return send(res,200,cached,{'Content-Type':'audio/wav','X-Lectoria-Cache':'hit'});
+        lastLive=Date.now(); // only engine work counts as live use; cache hits never hold a background job back
         res.on('close',()=> { if(!res.writableEnded)controller.abort(); });
         const key=(await fsp.readFile(KEY,'utf8')).trim();
-        const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify(payload),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});
+        const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text:payload.text,voice:payload.voice,rate:payload.rate}),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});
         if(!response.ok)return send(res,response.status,{error:response.status===429?'O motor de voz está ocupado. Tenta novamente dentro de instantes.':'Não foi possível gerar o áudio.'},{...(response.status===429?{'Retry-After':'2'}:{})});
-        const wav=await boundedResponse(response,20_000_000); if(cacheId)writeCache(cacheId,wav); return send(res,200,wav,{'Content-Type':'audio/wav'});
+        const wav=await boundedResponse(response,20_000_000); if(cacheId)await writeCache(cacheId,wav); if(cacheId&&/^[a-f0-9]{32}$/.test(String(payload.doc||'')))autoCompile(session,payload.doc,payload.voice,Number(payload.rate)); return send(res,200,wav,{'Content-Type':'audio/wav'});
       }
       if(route==='/api/cover' && req.method==='GET') {
         // Kavita serves cover thumbnails only against the account's apiKey (returned at login), never the bearer token.
@@ -345,7 +356,10 @@ async function handle(req,res) {
       }
       if(route==='/api/jobs' && req.method==='GET') {
         const st=await stats();const speeds={};for(const v of Object.keys(st))speeds[v]=speed(st,v);
-        return send(res,200,{jobs:await listJobs(session),speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD});
+        // ?voice=&rate= adds the partial-recording coverage of every shelf document for that voice.
+        const partial={};const voice=url.searchParams.get('voice'),rate=Number(url.searchParams.get('rate'));
+        if(voice&&rate){const dir=userDir(session);for(const file of (await fsp.readdir(dir).catch(()=>[])).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))){try{const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const c=await coverage(d,voice,rate);if(c.done)partial[d.id]={...c,title:d.title,cover:d.cover||null};}catch{}}}
+        return send(res,200,{jobs:await listJobs(session),speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD,partial});
       }
       if(route==='/api/jobs' && req.method==='POST')return send(res,201,await createJob(session,await json(req,4000)));
       const jobMatch=route.match(/^\/api\/jobs\/([a-f0-9]{32})(\/audio)?$/);
@@ -367,7 +381,10 @@ async function handle(req,res) {
       if(route==='/api/documents' && req.method==='POST')return send(res,201,await saveDoc(session,await json(req,12_000_000)));
       if(route==='/api/documents' && req.method==='GET') {
         const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];
-        for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,cover:d.cover||null});}
+        for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
+          // Reading position (and when it was last saved) so the shelf can show progress and "continue" ordering.
+          let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const [st,p]=await Promise.all([fsp.stat(pfile),fsp.readFile(pfile,'utf8').then(JSON.parse)]);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
+          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,progress});}
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
       }
       const coverMatch=route.match(/^\/api\/(documents|playlists)\/([a-f0-9]{32})\/cover$/);
