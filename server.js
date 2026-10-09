@@ -76,13 +76,16 @@ async function atomic(file, value) { await fsp.mkdir(path.dirname(file), { recur
 function validateDoc(doc) {
   if (!doc || !Array.isArray(doc.sections) || !doc.sections.length || doc.sections.length > 5000 || doc.sections.some(s => typeof s.text !== 'string' || typeof s.title !== 'string') || doc.sections.reduce((n,s) => n+s.text.length,0) > 2_000_000 || !doc.sections.some(s => s.text.trim())) throw error(400, 'Documento vazio ou demasiado extenso.');
   const cover = doc.cover === 'own' ? 'own' : /^https:\/\/\S{1,500}$/.test(String(doc.cover || '')) ? String(doc.cover) : null;
-  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text })), source: String(doc.source || 'Documento').slice(0,100), ...(cover ? { cover } : {}) };
+  const o = doc.origin; const origin = o && o.kind === 'kavita' && /^\d+$/.test(String(o.chapter)) ? { kind: 'kavita', chapter: Number(o.chapter), series: /^\d+$/.test(String(o.series)) ? Number(o.series) : null } : o && o.kind === 'blog' && /^\d{1,30}$/.test(String(o.post)) ? { kind: 'blog', blog: Number(o.blog) || 0, post: String(o.post) } : null;
+  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text })), source: String(doc.source || 'Documento').slice(0,100), ...(cover ? { cover } : {}), ...(origin ? { origin } : {}) };
 }
 async function saveDoc(s, doc) {
   doc = validateDoc(doc);
-  const id = hash(JSON.stringify(doc)).slice(0,32), dir = userDir(s);
+  let id = hash(JSON.stringify(doc)).slice(0,32); const dir = userDir(s);
   await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
   const files = (await fsp.readdir(dir)).filter(x => /^[a-f0-9]{32}\.json$/.test(x));
+  // Books and articles still being written: importing the same source again updates the existing document (same id, same place).
+  if (doc.origin) for (const file of files) { try { const old = JSON.parse(await fsp.readFile(path.join(dir, file), 'utf8')); if (old.origin && JSON.stringify(old.origin) === JSON.stringify(doc.origin)) { id = old.id; if (!doc.cover && old.cover) doc.cover = old.cover; break; } } catch {} }
   if (files.length >= 80 && !files.includes(id+'.json')) throw error(409, 'A tua estante tem 80 documentos. Remove alguns para continuar.');
   const full = { ...doc, id, updated: new Date().toISOString() }; await atomic(path.join(dir,id+'.json'), full); return full;
 }
@@ -307,13 +310,13 @@ async function handle(req,res) {
       if(route==='/api/books' && req.method==='GET') {
         const library=numeric(url.searchParams.get('library'));const page=Math.min(1000,Math.max(1,Number(url.searchParams.get('page'))||1));
         const query=String(url.searchParams.get('q')||'').slice(0,200);
-        const statements=[{field:19,comparison:0,value:String(library)}]; if(query)statements.push({field:1,comparison:5,value:query});
+        const statements=[{field:19,comparison:0,value:String(library)}]; if(query)statements.push({field:1,comparison:7,value:query});
         const response=await kavita(`/api/Series/all-v2?PageNumber=${page}&PageSize=48`,session,{method:'POST',body:JSON.stringify({statements,combination:1,sortOptions:{sortField:1,isAscending:true}})});
         return send(res,200,{books:await response.json(),pagination:response.headers.get('pagination')});
       }
       if(route==='/api/chapters' && req.method==='GET') {
         const detail=await(await kavita('/api/Series/series-detail?seriesId='+numeric(url.searchParams.get('series')),session)).json();
-        const map=new Map(); for(const c of [...(detail.chapters||[]),...(detail.specials||[]),...(detail.storylineChapters||[]),...(detail.volumes||[]).flatMap(v=>v.chapters||[])])map.set(c.id,{id:c.id,title:c.titleName||c.title||c.range||'Livro',pages:c.pages,format:c.format});
+        const map=new Map(); for(const c of [...(detail.chapters||[]),...(detail.specials||[]),...(detail.storylineChapters||[]),...(detail.volumes||[]).flatMap(v=>v.chapters||[])])map.set(c.id,{id:c.id,title:c.titleName||c.title||c.range||'Livro',pages:c.pages,format:c.format,modified:c.lastModifiedUtc?c.lastModifiedUtc+'Z':c.lastModified||null});
         return send(res,200,[...map.values()]);
       }
       if(route==='/api/import-book' && req.method==='POST') {
@@ -321,7 +324,7 @@ async function handle(req,res) {
         const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
         const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
         const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));
-        if(input.title)doc.title=String(input.title).slice(0,300); doc.source='Kavita'; const cover=await kavitaCover(session,input.series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return send(res,200,saved);
+        if(input.title)doc.title=String(input.title).slice(0,300); doc.source='Kavita'; doc.origin={kind:'kavita',chapter,series:input.series}; const cover=await kavitaCover(session,input.series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return send(res,200,saved);
       }
       if(route==='/api/upload' && req.method==='POST') {
         const name=String(url.searchParams.get('name')||'').slice(0,300);if(!/\.(epub|pdf|docx|txt|md)$/i.test(name))throw error(400,'Usa EPUB, PDF, DOCX, TXT ou Markdown.');
@@ -338,7 +341,7 @@ async function handle(req,res) {
         const input=await json(req,2000);const blog=blogIndex(input.blog);const post=String(input.post??'');if(!/^\d{1,30}$/.test(post))throw error(400,'Artigo inválido.'); // Blogger ids exceed 2^53, so they stay strings
         const entry=(await feedJson(BLOGS[blog]+'/feeds/posts/default/'+post+'?alt=json')).entry;if(!entry)throw error(404,'Artigo não encontrado.');
         const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
-        const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);const image=postImage(entry);if(image)doc.cover=image;return send(res,200,await saveDoc(session,doc));
+        const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);doc.origin={kind:'blog',blog,post};const image=postImage(entry);if(image)doc.cover=image;return send(res,200,await saveDoc(session,doc));
       }
       // Queue and playlists: lists of shelf document ids, one JSON file each, shared by every device of the account.
       const ids=list=>{if(!Array.isArray(list)||list.length>500||list.some(x=>!/^[a-f0-9]{32}$/.test(String(x))))throw error(400,'Lista inválida.');return list;};
@@ -385,7 +388,7 @@ async function handle(req,res) {
         for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
           // Reading position (and when it was last saved) so the shelf can show progress and "continue" ordering.
           let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const [st,p]=await Promise.all([fsp.stat(pfile),fsp.readFile(pfile,'utf8').then(JSON.parse)]);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
-          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,progress});}
+          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,progress});}
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
       }
       const coverMatch=route.match(/^\/api\/(documents|playlists)\/([a-f0-9]{32})\/cover$/);
