@@ -36,7 +36,19 @@ class Text(HTMLParser):
         self.flush(); return self.sections
 
 def clean(text):
-    return '\n\n'.join(' '.join(p.split()) for p in text.replace('\x00', '').splitlines() if p.strip())
+    """Paragraphs from lines. Lines broken mid-sentence (PDF text, one block per visual line in converted EPUBs) are
+    joined back: a line that does not end a sentence, followed by one starting in lower case or with trailing punctuation."""
+    out = []
+    for line in (' '.join(p.split()) for p in text.replace('\x00', '').splitlines()):
+        if not line: continue
+        if out and _continues(out[-1], line):
+            out[-1] = out[-1][:-1] + line if out[-1].endswith('-') and line[:1].islower() else out[-1] + ' ' + line
+        else: out.append(line)
+    return '\n\n'.join(out)
+
+def _continues(prev, line):
+    if prev[-1] in '.!?…:;"»”)' and not prev.endswith('-'): return False
+    return line[:1].islower() or line[:1] in ',;:)»”' or (prev.endswith('-') and line[:1].isalpha())
 
 def html_text(text):
     return '\n\n'.join(filter(None, [(s['title'] if s['title'] not in ('Início',) and not s['title'].startswith('Parte ') else '') + '\n\n' + s['text'] for s in html_topics(text)])).strip()
@@ -73,7 +85,7 @@ def epub(z):
 def extract(file, name, depth=0):
     ext = os.path.splitext(name.lower())[1]
     if ext == '.pdf':
-        result = subprocess.run(['pdftotext', '-layout', file, '-'], capture_output=True, timeout=60)
+        result = subprocess.run(['pdftotext', file, '-'], capture_output=True, timeout=60)
         if result.returncode: raise ValueError('Não foi possível ler este PDF.')
         if len(result.stdout) > 15_000_000: raise ValueError('PDF demasiado extenso.')
         pages = result.stdout.decode('utf-8', errors='replace').split('\f')

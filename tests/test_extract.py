@@ -10,7 +10,11 @@ class Extraction(unittest.TestCase):
   self.assertEqual([(t['title'],t['text']) for t in topics],[('Início','Abertura.'),('Primeiro tema','Um.\n\nDois.'),('Segundo tema','Três.')])
   self.assertEqual(html_text('<h1>Capítulo 1</h1><p>Era uma vez.</p>'),'Capítulo 1\n\nEra uma vez.')
  def test_wrapped_lines_inside_paragraphs_do_not_split_them(self):
-  self.assertEqual(html_text('<p>A Europa, com a sua rica génese, foi\nsempre um terreno\r\nfértil.</p><p>Outro<br>parágrafo.</p><h2>Título<o:p></o:p></h2><p>Fim.</p>'),'A Europa, com a sua rica génese, foi sempre um terreno fértil.\n\nOutro\n\nparágrafo.\n\nTítulo\n\nFim.')
+  self.assertEqual(html_text('<p>A Europa, com a sua rica génese, foi\nsempre um terreno\r\nfértil.</p><p>Outro<br>parágrafo.</p><h2>Título<o:p></o:p></h2><p>Fim.</p>'),'A Europa, com a sua rica génese, foi sempre um terreno fértil.\n\nOutro parágrafo.\n\nTítulo\n\nFim.')
+ def test_lines_broken_mid_sentence_are_joined(self):
+  from extract import clean
+  self.assertEqual(clean('A casa que os Maias vieram habitar em Lisboa,\nno outono de 1875, era conhe-\ncida na vizinhança.\nEra uma frase nova.\n\nCapítulo II\nOutra abertura.'),'A casa que os Maias vieram habitar em Lisboa, no outono de 1875, era conhecida na vizinhança.\n\nEra uma frase nova.\n\nCapítulo II\n\nOutra abertura.')
+  self.assertEqual(html_text('<p>Uma linha que continua</p><p>na linha seguinte.</p><p>Nova frase.</p>'),'Uma linha que continua na linha seguinte.\n\nNova frase.')
  def test_html_article_is_a_single_section(self):
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d)/'post.html'; p.write_text('<title>Art</title><p>Intro.</p><h2>Um</h2><p>Texto um.</p><h3>Dois</h3><p>Texto dois.</p>',encoding='utf-8')
