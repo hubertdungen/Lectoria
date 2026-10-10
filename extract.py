@@ -53,7 +53,8 @@ def _continues(prev, line):
     return line[:1].islower() or line[:1] in ',;:)»”' or (prev.endswith('-') and line[:1].isalpha())
 
 def html_text(text):
-    return '\n\n'.join(filter(None, [(s['title'] if s['title'] not in ('Início',) and not s['title'].startswith('Parte ') else '') + '\n\n' + s['text'] for s in html_topics(text)])).strip()
+    parts = [((s['title'] if s['title'] not in ('Início',) and not s['title'].startswith('Parte ') else '') + '\n\n' + s['text']).strip() for s in html_topics(text)]
+    return '\n\n'.join(p for p in parts if p)
 
 def html_topics(text):
     p = Text(); p.feed(text); return p.topics()
