@@ -12,7 +12,9 @@ class Text(HTMLParser):
         self.parts, self.skip, self.sections, self.heading, self.title = [], 0, [], None, ''
     def flush(self):
         text = clean(''.join(self.parts))
-        if text: self.sections.append({'title': self.title or ('Início' if not self.sections else f'Parte {len(self.sections)+1}'), 'text': text})
+        # A heading followed directly by another heading (chapter title, then scene heading) still counts: keep it with empty text.
+        if text or (self.title and (not self.sections or self.sections[-1]['title'] != self.title)):
+            self.sections.append({'title': self.title or ('Início' if not self.sections else f'Parte {len(self.sections)+1}'), 'text': text})
         self.parts = []
     def handle_starttag(self, tag, attrs):
         if tag in ('script', 'style', 'head', 'noscript', 'title'): self.skip += 1

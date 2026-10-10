@@ -15,6 +15,8 @@ class Extraction(unittest.TestCase):
   from extract import clean
   self.assertEqual(clean('A casa que os Maias vieram habitar em Lisboa,\nno outono de 1875, era conhe-\ncida na vizinhança.\nEra uma frase nova.\n\nCapítulo II\nOutra abertura.'),'A casa que os Maias vieram habitar em Lisboa, no outono de 1875, era conhecida na vizinhança.\n\nEra uma frase nova.\n\nCapítulo II\n\nOutra abertura.')
   self.assertEqual(html_text('<p>Uma linha que continua</p><p>na linha seguinte.</p><p>Nova frase.</p>'),'Uma linha que continua na linha seguinte.\n\nNova frase.')
+ def test_chapter_heading_followed_by_scene_heading_is_kept(self):
+  self.assertEqual(html_text('<h2>Capítulo Um — O Último Homem</h2><h3>Varsóvia — 2028</h3><p>Texto.</p>'),'Capítulo Um — O Último Homem\n\nVarsóvia — 2028\n\nTexto.')
  def test_html_article_is_a_single_section(self):
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d)/'post.html'; p.write_text('<title>Art</title><p>Intro.</p><h2>Um</h2><p>Texto um.</p><h3>Dois</h3><p>Texto dois.</p>',encoding='utf-8')
