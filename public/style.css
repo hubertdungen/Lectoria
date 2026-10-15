@@ -188,3 +188,9 @@ body.book-paged #book-frame{clip-path:inset(0 2px)}
 .notes-export-actions{display:flex;flex-wrap:wrap;gap:6px}
 .notes-export-actions button{width:auto;display:inline-flex;align-items:center;gap:6px;padding:0 12px;height:36px;margin:0}
 @media (pointer:coarse) and (min-width:561px){#note-text{min-height:200px;font-size:16px}}
+.prio-card{position:fixed;top:72px;right:16px;z-index:36;width:min(420px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:12px;box-shadow:var(--shadow);padding:12px 14px;display:grid;gap:10px}
+.prio-card[hidden]{display:none}
+.prio-card p{margin:0;line-height:1.45}
+.prio-actions{display:flex;justify-content:flex-end;gap:8px;align-items:center}
+.prio-actions button{width:auto;margin:0}
+@media(min-width:561px){.prio-card{top:auto;bottom:calc(var(--player-h,0px) + 16px)}}

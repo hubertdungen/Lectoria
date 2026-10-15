@@ -38,7 +38,8 @@ const { chunks } = require('./public/chunks.js');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Characters per second before any job has run; replaced by measured speed in stats.json.
 const DEFAULT_SPEED = voice => voice.startsWith('sopro_') ? 10 : voice === 'kokoro_eu_pt' ? 20 : voice.startsWith('pt_PT-') || voice.startsWith('phoonnx_') ? 100 : 50;
-let lastLive = 0; const running = { job: null, cancelled: new Set() };
+const LIVE_HOLD = Number(process.env.LECTORIA_LIVE_HOLD_MS) || 15000; // quiet time after live listening before a background job goes on
+let lastLive = 0; const running = { job: null, cancelled: new Set(), inflight: null, yieldTo: null };
 const sessions = new Map(), attempts = new Map();
 // Sessions outlive restarts: they are written to disk (0600) whenever they change.
 const SESSIONS = path.join(DATA, 'sessions.json');
@@ -329,15 +330,26 @@ function pcm(wav) {
 function wavHeader(bytes,rate,channels) { // ponytail: plain RIFF, so a single file tops out at 4 GB (~24 h at 24 kHz mono); split the book if that ever matters
   const h=Buffer.alloc(44); h.write('RIFF',0); h.writeUInt32LE(36+bytes,4); h.write('WAVE',8); h.write('fmt ',12); h.writeUInt32LE(16,16); h.writeUInt16LE(1,20); h.writeUInt16LE(channels,22); h.writeUInt32LE(rate,24); h.writeUInt32LE(rate*channels*2,28); h.writeUInt16LE(channels*2,32); h.writeUInt16LE(16,34); h.write('data',36); h.writeUInt32LE(bytes,40); return h;
 }
-async function synthesizeChunk(text,voice,rate,key) {
+async function synthesizeChunk(text,voice,rate,key,signal) {
   const cached=await readCache(voiceKey(text,voice,rate)); if(cached)return pcm(cached);
   for(let attempt=0;;attempt++) {
     try {
-      const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:AbortSignal.timeout(300000)});
+      const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(300000)]):AbortSignal.timeout(300000)});
       if(response.status===429) { await sleep(3000); continue; }
       if(!response.ok) throw new Error('synthesis-failed');
       const wav=await boundedResponse(response,20_000_000); writeCache(voiceKey(text,voice,rate),wav); return pcm(wav);
-    } catch(e) { if(attempt>=3) throw e; await sleep(5000); }
+    } catch(e) { if(signal?.aborted||attempt>=3) throw e; await sleep(5000); }
+  }
+}
+// A job passage that live listening interrupted is simply made again once the player is quiet.
+async function jobChunk(job,text,key) {
+  for(;;) {
+    while(Date.now()-lastLive<LIVE_HOLD) { if(running.cancelled.has(job.id)) throw new Error('cancelled'); await sleep(Math.min(3000,LIVE_HOLD)); }
+    if(running.cancelled.has(job.id)) throw new Error('cancelled');
+    const controller=new AbortController(); running.inflight=controller;
+    try { return await synthesizeChunk(text,job.voice,job.rate,key,controller.signal); }
+    catch(e) { if(!controller.signal.aborted) throw e; }
+    finally { running.inflight=null; }
   }
 }
 async function runJob(job,file) {
@@ -350,10 +362,10 @@ async function runJob(job,file) {
     for(const section of doc.sections) {
       job.chapters.push({title:section.title,seconds:rate?bytes/(rate*channels*2):0});
       for(const text of chunks(section.text)) {
-        // Live listening has priority over background jobs: wait while someone is using the player.
-        while(Date.now()-lastLive<15000) { if(running.cancelled.has(job.id)) throw new Error('cancelled'); await sleep(3000); }
-        if(running.cancelled.has(job.id)) throw new Error('cancelled');
-        const started=Date.now(); const audio=await synthesizeChunk(text,job.voice,job.rate,key);
+        // Live listening has priority over background jobs (jobChunk waits, and a live request interrupts it);
+        // a job given priority takes the engine at the next passage — what is done stays in the cache.
+        if(running.yieldTo&&running.yieldTo!==job.id) throw new Error('yield');
+        const started=Date.now(); const audio=await jobChunk(job,text,key);
         if(!rate) { rate=audio.rate; channels=audio.channels; } else if(audio.rate!==rate||audio.channels!==channels) throw new Error('synthesis-failed');
         await write(audio.data); await write(Buffer.alloc(Math.round(rate*0.4)*channels*2)); bytes+=audio.data.length+Math.round(rate*0.4)*channels*2;
         const seconds=(Date.now()-started)/1000; st[job.voice]={chars:(st[job.voice]?.chars||0)+text.length,seconds:(st[job.voice]?.seconds||0)+seconds};
@@ -377,6 +389,7 @@ async function runJob(job,file) {
     if(job.auto) for(const name of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x)&&x!==job.id+'.json')) { try { const old=JSON.parse(await fsp.readFile(path.join(dir,name),'utf8')); if(old.doc===job.doc&&old.voice===job.voice&&old.rate===job.rate&&old.status==='done') for(const ext of ['.json','.wav','.mp3']) await fsp.rm(path.join(dir,old.id+ext),{force:true}); } catch {} }
   } catch(e) {
     out.destroy(); await fsp.rm(base+'.pcm',{force:true});
+    if(e.message==='yield') { job.status='queued'; job.done={chunks:0,chars:0}; await atomic(file,job); return; }
     job.status=e.message==='cancelled'||job.status==='cancelling'?'cancelled':'error'; job.error=e.message==='cancelled'?'':e.message==='synthesis-failed'?'O motor de voz falhou a meio. Tenta novamente.':e.message; job.finished=new Date().toISOString();
   }
   await atomic(file,job);
@@ -390,9 +403,9 @@ async function tick() {
       try { const job=JSON.parse(await fsp.readFile(path.join(dir,name),'utf8')); if(['queued','running'].includes(job.status)&&Date.parse(job.startAt)<=Date.now()) candidates.push({job,file:path.join(dir,name)}); } catch {}
     }
   }
-  candidates.sort((a,b)=>a.job.startAt.localeCompare(b.job.startAt)||a.job.created.localeCompare(b.job.created));
+  candidates.sort((a,b)=>(b.job.priority||0)-(a.job.priority||0)||a.job.startAt.localeCompare(b.job.startAt)||a.job.created.localeCompare(b.job.created));
   if(!candidates.length) return;
-  const {job,file}=candidates[0]; running.job=job;
+  const {job,file}=candidates[0]; running.job=job; if(running.yieldTo===job.id) running.yieldTo=null;
   try { job.status='running'; job.started=job.started||new Date().toISOString(); job.done={chunks:0,chars:0}; /* a job resumed after a restart starts over; finished passages come from the cache */ await atomic(file,job); await runJob(job,file); } catch {} finally { running.job=null; running.cancelled.delete(job.id); }
 }
 async function importKavita(session,chapter,series,title) {
@@ -480,9 +493,10 @@ async function handle(req,res) {
         const cacheId=typeof payload.text==='string'&&typeof payload.voice==='string'?voiceKey(payload.text,payload.voice,Number(payload.rate)):null;
         const cached=cacheId&&await readCache(cacheId); if(cached)return send(res,200,cached,{'Content-Type':'audio/wav','X-Lectoria-Cache':'hit'});
         lastLive=Date.now(); // only engine work counts as live use; cache hits never hold a background job back
+        if(running.inflight) running.inflight.abort(); // the reader does not wait for a background passage to finish
         res.on('close',()=> { if(!res.writableEnded)controller.abort(); });
         const key=(await fsp.readFile(KEY,'utf8')).trim();
-        const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text:payload.text,voice:payload.voice,rate:payload.rate}),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});
+        let response;for(let i=0;;i++){response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text:payload.text,voice:payload.voice,rate:payload.rate}),signal:AbortSignal.any([controller.signal,AbortSignal.timeout(120000)])});if(response.status!==429||i>=10)break;await sleep(300);} // the interrupted job releases the engine within moments
         if(!response.ok)return send(res,response.status,{error:response.status===429?'O motor de voz está ocupado. Tenta novamente dentro de instantes.':'Não foi possível gerar o áudio.'},{...(response.status===429?{'Retry-After':'2'}:{})});
         const wav=await boundedResponse(response,20_000_000); if(cacheId)await writeCache(cacheId,wav); if(cacheId&&/^[a-f0-9]{32}$/.test(String(payload.doc||'')))autoCompile(session,payload.doc,payload.voice,Number(payload.rate)); return send(res,200,wav,{'Content-Type':'audio/wav'});
       }
@@ -548,6 +562,15 @@ async function handle(req,res) {
         return send(res,200,{jobs:await listJobs(session),speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD,partial});
       }
       if(route==='/api/jobs' && req.method==='POST')return send(res,201,await createJob(session,await json(req,4000)));
+      const prioMatch=route.match(/^\/api\/jobs\/([a-f0-9]{32})\/priority$/);
+      if(prioMatch&&req.method==='POST') {
+        // Front of the queue; "now" also brings a scheduled start forward. A running job yields at its next passage.
+        const file=path.join(userDir(session),'jobs',prioMatch[1]+'.json'); let job;try{job=JSON.parse(await fsp.readFile(file,'utf8'));}catch{throw error(404,'Áudio não encontrado.');}
+        if(!['queued','running'].includes(job.status)) throw error(409,'Este áudio já não está em fila.');
+        const input=await json(req,1000); job.priority=Date.now(); if(input.now&&Date.parse(job.startAt)>Date.now()) job.startAt=new Date().toISOString();
+        await atomic(file,job); if(running.job&&running.job.id!==job.id&&Date.parse(job.startAt)<=Date.now()) running.yieldTo=job.id;
+        return send(res,200,{ok:true,startAt:job.startAt});
+      }
       const jobMatch=route.match(/^\/api\/jobs\/([a-f0-9]{32})(\/audio)?$/);
       if(jobMatch) {
         const file=path.join(userDir(session),'jobs',jobMatch[1]+'.json');
