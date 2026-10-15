@@ -61,7 +61,7 @@ async function json(req, limit = 6_000_000) {
   catch (e) { if (e.status) throw e; throw error(400, 'Pedido inválido.'); }
 }
 async function kavita(route, session, options = {}) {
-  const response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: AbortSignal.timeout(120000) });
+  const response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: options.signal || AbortSignal.timeout(120000) });
   if (!response.ok) { const detail = await response.text().catch(() => ''); throw error(response.status === 401 || response.status === 403 ? 401 : 502, response.status === 401 || response.status === 403 ? 'Volta a entrar no Kavita para continuar.' : /input\/output|not found|no such file/i.test(detail) ? 'O Kavita não consegue ler o ficheiro deste livro no disco (erro de disco ou ficheiro em falta). Verifica a montagem do disco de media.' : 'O Kavita não conseguiu responder a este pedido.'); }
   return response;
 }
@@ -77,9 +77,11 @@ function validateDoc(doc) {
   if (!doc || !Array.isArray(doc.sections) || !doc.sections.length || doc.sections.length > 5000 || doc.sections.some(s => typeof s.text !== 'string' || typeof s.title !== 'string') || doc.sections.reduce((n,s) => n+s.text.length,0) > 2_000_000 || !doc.sections.some(s => s.text.trim())) throw error(400, 'Documento vazio ou demasiado extenso.');
   const cover = doc.cover === 'own' ? 'own' : /^https:\/\/\S{1,500}$/.test(String(doc.cover || '')) ? String(doc.cover) : null;
   const o = doc.origin; const origin = o && o.kind === 'kavita' && /^\d+$/.test(String(o.chapter)) ? { kind: 'kavita', chapter: Number(o.chapter), series: /^\d+$/.test(String(o.series)) ? Number(o.series) : null } : o && o.kind === 'blog' && /^\d{1,30}$/.test(String(o.post)) ? { kind: 'blog', blog: Number(o.blog) || 0, post: String(o.post) } : null;
-  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text })), source: String(doc.source || 'Documento').slice(0,100), ...(cover ? { cover } : {}), ...(origin ? { origin } : {}) };
+  const href = h => typeof h === 'string' && /^[^\0\\]{1,300}$/.test(h) && !h.split('/').includes('..') ? { href: h } : {};
+  return { title: String(doc.title || 'Sem título').slice(0,300), sections: doc.sections.map(s => ({ title: s.title.slice(0,200), text: s.text, ...(doc.book ? href(s.href) : {}), ...(Number.isInteger(s.page) && s.page >= 0 ? { page: s.page } : {}) })), ...(doc.book === true ? { book: true } : {}), source: String(doc.source || 'Documento').slice(0,100), ...(cover ? { cover } : {}), ...(origin ? { origin } : {}) };
 }
 async function saveDoc(s, doc) {
+  const bookDir = doc && typeof doc.bookDir === 'string' && doc.bookDir.startsWith(os.tmpdir()) ? doc.bookDir : null;
   doc = validateDoc(doc);
   let id = hash(JSON.stringify(doc)).slice(0,32); const dir = userDir(s);
   await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -87,7 +89,11 @@ async function saveDoc(s, doc) {
   // Books and articles still being written: importing the same source again updates the existing document (same id, same place).
   if (doc.origin) for (const file of files) { try { const old = JSON.parse(await fsp.readFile(path.join(dir, file), 'utf8')); if (old.origin && JSON.stringify(old.origin) === JSON.stringify(doc.origin)) { id = old.id; if (!doc.cover && old.cover) doc.cover = old.cover; break; } } catch {} }
   if (files.length >= 80 && !files.includes(id+'.json')) throw error(409, 'A tua estante tem 80 documentos. Remove alguns para continuar.');
-  const full = { ...doc, id, updated: new Date().toISOString() }; await atomic(path.join(dir,id+'.json'), full); return full;
+  const full = { ...doc, id, updated: new Date().toISOString() }; await atomic(path.join(dir,id+'.json'), full);
+  const book = path.join(dir, 'books', id); await fsp.rm(book, { recursive: true, force: true });
+  if (bookDir && full.book) { await fsp.mkdir(path.dirname(book), { recursive: true, mode: 0o700 }); await fsp.cp(bookDir, book, { recursive: true }); }
+  if (bookDir) await fsp.rm(bookDir, { recursive: true, force: true });
+  return full;
 }
 async function boundedResponse(response, limit) {
   if (Number(response.headers.get('content-length')) > limit) throw error(413, 'Livro demasiado grande (máximo 50 MB).');
@@ -100,14 +106,64 @@ async function extract(buffer, name) {
   try {
     await fsp.writeFile(file, buffer, { mode: 0o600 });
     return await new Promise((resolve,reject) => {
-      const child = spawn('python3', [path.join(__dirname,'extract.py'),file,name], { stdio: ['ignore','pipe','ignore'] });
+      const child = spawn('python3', [path.join(__dirname,'extract.py'),file,name,path.join(dir,'book')], { stdio: ['ignore','pipe','ignore'] });
       const parts = []; let size = 0, done = false;
       const timer = setTimeout(()=> { child.kill('SIGKILL'); reject(error(408,'Este documento demorou demasiado tempo a abrir.')); },75000);
       child.stdout.on('data', x => { size += x.length; if (size > 12_000_000) child.kill('SIGKILL'); else parts.push(x); });
       child.on('error',()=> { clearTimeout(timer); reject(error(503,'O conversor de documentos não está disponível.')); });
       child.on('close', code => { clearTimeout(timer); if (done) return; done=true; try { const doc=JSON.parse(Buffer.concat(parts).toString()); if(code || doc.error) throw error(400,doc.error || 'Não foi possível abrir o documento.'); resolve(doc); } catch(e) { reject(e.status ? e : error(400,'Não foi possível abrir o documento.')); } });
-    });
+    }).then(async doc => { if (doc.book) { doc.bookDir = await fsp.mkdtemp(path.join(os.tmpdir(),'lectoria-book-')); await fsp.cp(path.join(dir,'book'), doc.bookDir, { recursive:true }); } return doc; });
   } finally { await fsp.rm(dir, { recursive:true, force:true }); }
+}
+// Reading position shared with Kavita: a section is a Kavita page (`page`, its spine index), a paragraph is the
+// block Kavita stores as bookScrollId (an xpath inside that page). Positions travel by paragraph start.
+function anchors(session, doc, section) {
+  const s = doc.sections[section]; if (!doc.book || !s?.href) return Promise.resolve([]);
+  return new Promise(resolve => { const child = spawn('python3', [path.join(__dirname,'extract.py'),'--anchors',path.join(userDir(session),'books',doc.id,...s.href.split('/'))], { stdio: ['ignore','pipe','ignore'] }); const parts = []; child.stdout.on('data', x => parts.push(x)); child.on('error', () => resolve([])); child.on('close', () => { try { resolve(JSON.parse(Buffer.concat(parts))); } catch { resolve([]); } }); });
+}
+const anchorKey = s => s.replace(/\s+/g,'').toLowerCase().slice(0,30);
+const paraStarts = text => { const out = []; for (let i = 0; i < text.length; i = text.indexOf('\n', i) + 1 || text.length) if (text[i] !== '\n') out.push(i); return out; };
+const paraAt = (text, position) => paraStarts(text).filter(p => p <= position).pop() || 0;
+function toXpath(list, text, position) {
+  const at = paraAt(text, position), want = anchorKey(text.slice(at, at + 200)); if (!want) return null;
+  const nth = paraStarts(text).filter(p => p < at && anchorKey(text.slice(p, p + 200)) === want).length;
+  const hits = list.filter(a => anchorKey(a.text) && (anchorKey(a.text).startsWith(want) || want.startsWith(anchorKey(a.text))));
+  return (hits[nth] || hits[hits.length - 1])?.xpath || null;
+}
+function fromXpath(list, text, xpath) {
+  let i = list.findIndex(a => a.xpath === xpath || a.idpath === xpath); if (i < 0) i = list.findIndex(a => a.xpath.startsWith(xpath + '/') || a.idpath?.startsWith(xpath + '/')); if (i < 0) return 0;
+  const want = anchorKey(list[i].text); const nth = list.slice(0, i).filter(a => anchorKey(a.text) === want).length;
+  const starts = paraStarts(text).filter(p => { const k = anchorKey(text.slice(p, p + 200)); return k.startsWith(want) || want.startsWith(k); });
+  return starts[nth] ?? starts[starts.length - 1] ?? 0;
+}
+const kavitaIds = new Map(); // chapter → {volumeId, seriesId, libraryId, pages}
+async function chapterIds(session, o) {
+  if (!kavitaIds.has(o.chapter)) { const signal = AbortSignal.timeout(8000); const c = await (await kavita('/api/Series/chapter?chapterId=' + o.chapter, session, { signal })).json(); const v = await (await kavita('/api/Series/volume?volumeId=' + c.volumeId, session, { signal })).json(); const s = await (await kavita('/api/Series/' + v.seriesId, session, { signal })).json(); kavitaIds.set(o.chapter, { volumeId: c.volumeId, seriesId: v.seriesId, libraryId: s.libraryId, pages: c.pages }); }
+  return kavitaIds.get(o.chapter);
+}
+// Lectoria → Kavita, once per paragraph. Reaching the last paragraph of the book marks it read (pageNum = pages).
+async function pushKavita(session, doc, p, old) {
+  const s = doc.sections[p.section]; if (doc.origin?.kind !== 'kavita' || !Number.isInteger(s?.page)) return p;
+  const para = paraAt(s.text, p.position); if (old?.kavita && old.kavita.section === p.section && old.kavita.para === para) return { ...p, kavita: old.kavita };
+  try {
+    const ids = await chapterIds(session, doc.origin), last = p.section === doc.sections.length - 1 && !paraStarts(s.text).some(x => x > para);
+    const page = last ? ids.pages : s.page, scroll = last ? null : toXpath(await anchors(session, doc, p.section), s.text, p.position);
+    await kavita('/api/Reader/progress', session, { method: 'POST', signal: AbortSignal.timeout(8000), body: JSON.stringify({ volumeId: ids.volumeId, chapterId: doc.origin.chapter, pageNum: page, seriesId: ids.seriesId, libraryId: ids.libraryId, bookScrollId: scroll }) });
+    return { ...p, kavita: { section: p.section, para, page, scroll } };
+  } catch { return p; } // Kavita away: the next paragraph tries again
+}
+// Kavita → Lectoria: adopt Kavita's position when it was saved after ours (read in Kavita's own reader or another app).
+async function pullKavita(session, doc, file) {
+  let local = { section: 0, position: 0 }, mtime = 0; try { mtime = (await fsp.stat(file)).mtimeMs; local = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
+  if (doc.origin?.kind !== 'kavita' || !doc.sections.some(s => Number.isInteger(s.page))) return local;
+  try {
+    const k = await (await kavita('/api/Reader/get-progress?chapterId=' + doc.origin.chapter, session, { signal: AbortSignal.timeout(4000) })).json();
+    if (!(Date.parse(String(k.lastModifiedUtc).replace(/Z?$/, 'Z')) > mtime) || (local.kavita?.page === k.pageNum && (local.kavita.scroll || null) === (k.bookScrollId || null))) return local;
+    let section = 0; doc.sections.forEach((s, i) => { if (s.page <= k.pageNum) section = i; }); const s = doc.sections[section];
+    const position = s.page === k.pageNum && k.bookScrollId ? fromXpath(await anchors(session, doc, section), s.text, k.bookScrollId) : 0;
+    const p = { section, position, kavita: { section, para: paraAt(s.text, position), page: k.pageNum, scroll: k.bookScrollId || null } };
+    await atomic(file, p); return p;
+  } catch { return local; }
 }
 // Covers (uploaded, or copied from Kavita at import): small images under users/<u>/covers, validated by magic bytes.
 const imageType = buf => buf.length>12 && buf[0]===0xff && buf[1]===0xd8 ? 'image/jpeg' : buf.toString('ascii',1,4)==='PNG' ? 'image/png' : buf.toString('ascii',0,4)==='RIFF'&&buf.toString('ascii',8,12)==='WEBP' ? 'image/webp' : null;
@@ -166,7 +222,7 @@ async function createJob(s,input) {
   const twin=jobs.find(j=>j.title.trim().toLowerCase()===doc.title.trim().toLowerCase()&&j.voice===voice.id&&j.rate===rate&&['queued','running','cancelling','done'].includes(j.status)); if(twin&&!input.force) throw error(409,twin.status==='done'?'Já existe este áudio com esta voz e velocidade. Remove-o em Áudios se quiseres gerar outro.':'Este áudio já está na fila com esta voz e velocidade.');
   const total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { total.chunks++; total.chars+=c.length; }
   if(!total.chunks) throw error(400,'O documento não tem texto para ler.');
-  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id))};
+  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id)),...(input.auto?{auto:true}:{})};
   await atomic(path.join(jobsDir(s),job.id+'.json'),job); return job;
 }
 function pcm(wav) {
@@ -228,6 +284,7 @@ async function runJob(job,file) {
     job.seconds=Math.round(bytes/(rate*channels*2));
     if(job.destination==='cloud') { await fsp.mkdir(CLOUD,{recursive:true}); const target=path.join(CLOUD,safeName(job.title)+' · '+safeName(job.voiceName.split(' · ')[0])+path.extname(job.file)); await fsp.copyFile(path.join(dir,job.file),target); job.cloudPath=target; }
     job.status='done'; job.finished=new Date().toISOString(); job.eta=0;
+    if(job.auto) for(const name of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x)&&x!==job.id+'.json')) { try { const old=JSON.parse(await fsp.readFile(path.join(dir,name),'utf8')); if(old.doc===job.doc&&old.voice===job.voice&&old.rate===job.rate&&old.status==='done') for(const ext of ['.json','.wav','.mp3']) await fsp.rm(path.join(dir,old.id+ext),{force:true}); } catch {} }
   } catch(e) {
     out.destroy(); await fsp.rm(base+'.pcm',{force:true});
     job.status=e.message==='cancelled'||job.status==='cancelling'?'cancelled':'error'; job.error=e.message==='cancelled'?'':e.message==='synthesis-failed'?'O motor de voz falhou a meio. Tenta novamente.':e.message; job.finished=new Date().toISOString();
@@ -246,7 +303,48 @@ async function tick() {
   candidates.sort((a,b)=>a.job.startAt.localeCompare(b.job.startAt)||a.job.created.localeCompare(b.job.created));
   if(!candidates.length) return;
   const {job,file}=candidates[0]; running.job=job;
-  try { job.status='running'; job.started=job.started||new Date().toISOString(); await atomic(file,job); await runJob(job,file); } catch {} finally { running.job=null; running.cancelled.delete(job.id); }
+  try { job.status='running'; job.started=job.started||new Date().toISOString(); job.done={chunks:0,chars:0}; /* a job resumed after a restart starts over; finished passages come from the cache */ await atomic(file,job); await runJob(job,file); } catch {} finally { running.job=null; running.cancelled.delete(job.id); }
+}
+async function importKavita(session,chapter,series,title) {
+  const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
+  const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
+  const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));
+  if(title)doc.title=String(title).slice(0,300); doc.source='Kavita'; doc.origin={kind:'kavita',chapter,series}; const cover=await kavitaCover(session,series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return saved;
+}
+async function importPost(session,blog,post,entry) {
+  entry=entry||(await feedJson(BLOGS[blog]+'/feeds/posts/default/'+post+'?alt=json')).entry;if(!entry)throw error(404,'Artigo não encontrado.');
+  const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
+  const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);doc.origin={kind:'blog',blog,post};const image=postImage(entry);if(image)doc.cover=image;return saveDoc(session,doc);
+}
+// Next start for automatic audio: the user's chosen hour (server local time), or right away.
+function nextAt(hour){const h=Number(hour);if(hour===''||hour==null||!(h>=0&&h<=23))return new Date();const d=new Date();d.setMinutes(0,0,0);d.setHours(h);if(d<=new Date())d.setDate(d.getDate()+1);return d;}
+// Background sync, per account with a live session (it needs the Kavita token): every `syncEvery` hours re-import
+// shelf items whose source changed; then make sure every item marked for automatic audio has a current full audio.
+async function autoSync() {
+  const users=new Map(); for(const s of sessions.values()) if(s.expires>Date.now()&&(!users.has(s.userId)||users.get(s.userId).expires<s.expires)) users.set(s.userId,s); // ponytail: an account with no session for 14 days is not synced until it logs in again
+  for(const s of users.values()) {
+    const dir=userDir(s); const read=async(n,f)=>{try{return JSON.parse(await fsp.readFile(path.join(dir,n),'utf8'));}catch{return f;}};
+    const settings=await read('settings.json',{}); const every=Number(settings.syncEvery??1)||0; const sync=await read('sync.json',{});
+    const docs=[]; for(const f of (await fsp.readdir(dir).catch(()=>[])).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) { try{docs.push(JSON.parse(await fsp.readFile(path.join(dir,f),'utf8')));}catch{} }
+    if(every>0&&Date.now()-(Date.parse(sync.last)||0)>=every*3600000) {
+      const updated=[];
+      for(const d of docs.filter(d=>d.origin)) {
+        try {
+          if(d.origin.kind==='kavita') { const c=await(await kavita('/api/Series/chapter?chapterId='+d.origin.chapter,s)).json(); if(c.lastModifiedUtc&&Date.parse(c.lastModifiedUtc.replace(/Z?$/,'Z'))>Date.parse(d.updated)) { await importKavita(s,d.origin.chapter,d.origin.series,d.title); updated.push(d.title); } }
+          else if(BLOGS[d.origin.blog]) { const entry=(await feedJson(BLOGS[d.origin.blog]+'/feeds/posts/default/'+d.origin.post+'?alt=json')).entry; if(entry&&Date.parse(entry.updated?.$t)>Date.parse(d.updated)) { await importPost(s,d.origin.blog,d.origin.post,entry); updated.push(d.title); } }
+        } catch {}
+      }
+      await atomic(path.join(dir,'sync.json'),{last:new Date().toISOString(),updated});
+      if(updated.length) { docs.length=0; for(const f of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) { try{docs.push(JSON.parse(await fsp.readFile(path.join(dir,f),'utf8')));}catch{} } }
+    }
+    const auto=await read('auto.json',{}); if(!Object.keys(auto).length) continue; const jobs=await listJobs(s);
+    for(const d of docs) {
+      const a=auto[d.id]; if(!a) continue;
+      // A job already covers this version when it is still pending, or was created after the document last changed (done, failed or cancelled: no retry loop).
+      if(jobs.some(j=>j.doc===d.id&&j.voice===a.voice&&j.rate===a.rate&&(['queued','running','cancelling'].includes(j.status)||j.created>=d.updated))) continue;
+      try { await createJob(s,{doc:d.id,voice:a.voice,rate:a.rate,destination:settings.cloudCopy==='1'&&CLOUD?'cloud':'download',startAt:nextAt(settings.autoHour??'3').toISOString(),force:true,auto:true}); } catch {}
+    }
+  }
 }
 function sameOrigin(req) {
   const origin = req.headers.origin;
@@ -320,11 +418,7 @@ async function handle(req,res) {
         return send(res,200,[...map.values()]);
       }
       if(route==='/api/import-book' && req.method==='POST') {
-        const input=await json(req,2000),chapter=numeric(input.chapter);
-        const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
-        const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
-        const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));
-        if(input.title)doc.title=String(input.title).slice(0,300); doc.source='Kavita'; doc.origin={kind:'kavita',chapter,series:input.series}; const cover=await kavitaCover(session,input.series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return send(res,200,saved);
+        const input=await json(req,2000);return send(res,200,await importKavita(session,numeric(input.chapter),input.series,input.title));
       }
       if(route==='/api/upload' && req.method==='POST') {
         const name=String(url.searchParams.get('name')||'').slice(0,300);if(!/\.(epub|pdf|docx|txt|md)$/i.test(name))throw error(400,'Usa EPUB, PDF, DOCX, TXT ou Markdown.');
@@ -338,10 +432,8 @@ async function handle(req,res) {
         return send(res,200,{title:feed.title?.$t||BLOGS[blog],total:Number(feed['openSearch$totalResults']?.$t)||posts.length,posts});
       }
       if(route==='/api/import-post' && req.method==='POST') {
-        const input=await json(req,2000);const blog=blogIndex(input.blog);const post=String(input.post??'');if(!/^\d{1,30}$/.test(post))throw error(400,'Artigo inválido.'); // Blogger ids exceed 2^53, so they stay strings
-        const entry=(await feedJson(BLOGS[blog]+'/feeds/posts/default/'+post+'?alt=json')).entry;if(!entry)throw error(404,'Artigo não encontrado.');
-        const html='<title>'+String(entry.title?.$t||'Artigo').replace(/</g,'&lt;')+'</title>'+String(entry.content?.$t||'');
-        const doc=await extract(Buffer.from(html,'utf8'),'post.html');doc.source=String((await blogs())[blog].title).slice(0,100);doc.origin={kind:'blog',blog,post};const image=postImage(entry);if(image)doc.cover=image;return send(res,200,await saveDoc(session,doc));
+        const input=await json(req,2000);const post=String(input.post??'');if(!/^\d{1,30}$/.test(post))throw error(400,'Artigo inválido.'); // Blogger ids exceed 2^53, so they stay strings
+        return send(res,200,await importPost(session,blogIndex(input.blog),post));
       }
       // Queue and playlists: lists of shelf document ids, one JSON file each, shared by every device of the account.
       const ids=list=>{if(!Array.isArray(list)||list.length>500||list.some(x=>!/^[a-f0-9]{32}$/.test(String(x))))throw error(400,'Lista inválida.');return list;};
@@ -382,13 +474,21 @@ async function handle(req,res) {
           return send(res,200,{ok:true});
         }
       }
+      const autoMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/auto$/);
+      if(autoMatch&&req.method==='PUT') {
+        const input=await json(req,2000);const auto=await readJson('auto.json',{});
+        if(input.voice==null) delete auto[autoMatch[1]];
+        else { await fsp.access(path.join(userDir(session),autoMatch[1]+'.json')).catch(()=>{throw error(404,'Documento não encontrado.');}); const rate=Number(input.rate); if(typeof input.voice!=='string'||!/^[\w.-]{1,80}$/.test(input.voice)||!(rate>=0.5&&rate<=2))throw error(400,'Voz ou velocidade inválida.'); auto[autoMatch[1]]={voice:input.voice,rate}; }
+        await atomic(path.join(userDir(session),'auto.json'),auto); autoSync().catch(()=>{}); return send(res,200,{auto:auto[autoMatch[1]]||null});
+      }
+      if(route==='/api/sync' && req.method==='GET')return send(res,200,await readJson('sync.json',{}));
       if(route==='/api/documents' && req.method==='POST')return send(res,201,await saveDoc(session,await json(req,12_000_000)));
       if(route==='/api/documents' && req.method==='GET') {
-        const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];
+        const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];const auto=await readJson('auto.json',{});
         for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
           // Reading position (and when it was last saved) so the shelf can show progress and "continue" ordering.
-          let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const [st,p]=await Promise.all([fsp.stat(pfile),fsp.readFile(pfile,'utf8').then(JSON.parse)]);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
-          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,progress});}
+          let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const p=await pullKavita(session,d,pfile);const st=await fsp.stat(pfile);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
+          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,auto:auto[d.id]||null,progress});}
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
       }
       const coverMatch=route.match(/^\/api\/(documents|playlists)\/([a-f0-9]{32})\/cover$/);
@@ -402,12 +502,21 @@ async function handle(req,res) {
           return send(res,200,{ok:true});
         }
       }
+      const bookMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/book\/(.+)$/);
+      if(bookMatch&&req.method==='GET') {
+        const base=path.join(userDir(session),'books',bookMatch[1]); let rel; try{rel=decodeURIComponent(bookMatch[2]);}catch{throw error(400,'Caminho inválido.');}
+        const file=path.resolve(base,rel); if(!file.startsWith(base+path.sep))throw error(400,'Caminho inválido.');
+        let buf; try{buf=await fsp.readFile(file);}catch{throw error(404,'Ficheiro não encontrado.');}
+        const types={'.xhtml':'application/xhtml+xml','.html':'text/html','.htm':'text/html','.css':'text/css','.svg':'image/svg+xml','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.ttf':'font/ttf','.otf':'font/otf','.woff':'font/woff','.woff2':'font/woff2'};
+        // Book files are untrusted markup: never scripts, never anything from outside this origin.
+        return send(res,200,buf,{'Content-Type':(types[path.extname(file).toLowerCase()]||'application/octet-stream')+(/\.(x?html?|css|svg)$/i.test(file)?'; charset=utf-8':''),'Content-Security-Policy':"default-src 'self' data:; script-src 'none'; object-src 'none'; style-src 'self' 'unsafe-inline' data:; frame-ancestors 'self'",'X-Content-Type-Options':'nosniff','Cache-Control':'private, max-age=600'});
+      }
       const match=route.match(/^\/api\/documents\/([a-f0-9]{32})(\/progress)?$/);
       if(match) {
         const file=path.join(userDir(session),match[1]+(match[2]?'.progress':'')+'.json');
-        if(req.method==='GET') { try{return send(res,200,JSON.parse(await fsp.readFile(file,'utf8')));}catch(e){if(match[2]&&e.code==='ENOENT')return send(res,200,{section:0,position:0});throw error(404,'Documento não encontrado.');} }
-        if(match[2] && req.method==='PUT') { await fsp.access(path.join(userDir(session),match[1]+'.json')).catch(()=>{throw error(404,'Documento não encontrado.');});const input=await json(req,1000);if(!Number.isInteger(input.section)||input.section<0||!Number.isInteger(input.position)||input.position<0||input.position>2_000_000||input.section>5000)throw error(400,'Posição inválida.');await atomic(file,{section:input.section,position:input.position});return send(res,200,{ok:true}); }
-        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});await fsp.rm(coverFile(session,match[1]),{force:true});return send(res,200,{ok:true}); }
+        if(req.method==='GET') { try{const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),match[1]+'.json'),'utf8'));if(match[2]){const p=await pullKavita(session,doc,file);return send(res,200,{section:p.section,position:p.position});}return send(res,200,doc);}catch(e){if(match[2]&&e.code==='ENOENT')return send(res,200,{section:0,position:0});throw error(404,'Documento não encontrado.');} }
+        if(match[2] && req.method==='PUT') { const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),match[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));const input=await json(req,1000);if(!Number.isInteger(input.section)||input.section<0||!Number.isInteger(input.position)||input.position<0||input.position>2_000_000||input.section>5000)throw error(400,'Posição inválida.');const old=await fsp.readFile(file,'utf8').then(JSON.parse).catch(()=>null);await atomic(file,await pushKavita(session,doc,{section:input.section,position:input.position},old));return send(res,200,{ok:true}); }
+        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});await fsp.rm(coverFile(session,match[1]),{force:true});await fsp.rm(path.join(userDir(session),'books',match[1]),{recursive:true,force:true});return send(res,200,{ok:true}); }
       }
       return send(res,404,{error:'Pedido não encontrado.'});
     }
@@ -420,5 +529,5 @@ async function handle(req,res) {
   }catch(e){if(!res.destroyed&&!res.writableEnded)send(res,e.status||500,{error:e.status?e.message:'Ocorreu um problema. Tenta novamente.'});}
 }
 const cleanup=setInterval(()=>{let changed=false;for(const [id,s]of sessions)if(s.expires<Date.now()){sessions.delete(id);changed=true;}if(changed)saveSessions();for(const[ip,a]of attempts)if(a.until<Date.now())attempts.delete(ip);},60000);cleanup.unref();
-if(require.main===module) { process.umask(0o077);http.createServer(handle).listen(Number(process.env.PORT)||8104,process.env.HOST||'0.0.0.0',()=>console.log('Lectoria pronta na porta '+(process.env.PORT||8104))); setInterval(()=>tick().catch(()=>{}),10000); }
-module.exports={handle,validateDoc,extract,hash,tick,pcm,wavHeader};
+if(require.main===module) { process.umask(0o077);http.createServer(handle).listen(Number(process.env.PORT)||8104,process.env.HOST||'0.0.0.0',()=>console.log('Lectoria pronta na porta '+(process.env.PORT||8104))); setInterval(()=>tick().catch(()=>{}),10000); setInterval(()=>autoSync().catch(()=>{}),600000); setTimeout(()=>autoSync().catch(()=>{}),60000); }
+module.exports={handle,validateDoc,extract,hash,tick,pcm,wavHeader,nextAt};
