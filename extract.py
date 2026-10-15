@@ -133,7 +133,7 @@ def extract(file, name, depth=0, unpack=None):
         if result.returncode: raise ValueError('Não foi possível ler este PDF.')
         if len(result.stdout) > 15_000_000: raise ValueError('PDF demasiado extenso.')
         pages = result.stdout.decode('utf-8', errors='replace').split('\f')
-        doc = {'title': os.path.splitext(os.path.basename(name))[0], 'sections': [{'title': f'Página {i+1}', 'text': clean(t), 'page': i} for i,t in enumerate(pages) if t.strip()]}
+        doc = {'title': os.path.splitext(os.path.basename(name))[0], 'sections': [{'title': f'Página {i+1}', 'text': clean(t), 'page': i + 1} for i,t in enumerate(pages) if t.strip()]}
         if not doc['sections']: raise ValueError('Este PDF não contém texto selecionável. Precisa de OCR.')
         return doc
     if ext in ('.epub', '.docx', '.zip'):

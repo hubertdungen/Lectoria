@@ -13,6 +13,7 @@ const KEY = process.env.LECTORIA_VOICE_KEY_FILE || path.join(DATA, 'voice-bridge
 // Blogs the reader may import from (public Blogger feeds); an allowlist so the server never fetches arbitrary URLs.
 const BLOGS = (process.env.LECTORIA_BLOGS ?? 'https://ocosmosracional.blogspot.com,https://therationalcosmos.blogspot.com').split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const CLOUD = process.env.LECTORIA_CLOUD_DIR || '';
+const EXPORTS = process.env.LECTORIA_EXPORT_DIR || ''; // Word exports saved on the server (shared folder)
 const PYTHON = process.env.LECTORIA_PYTHON ?? 'python3';
 const STATS = path.join(DATA, 'stats.json');
 // Passages synthesised on the host are kept on disk (a `cache/` folder, which the Kopia backup ignores) so a refresh,
@@ -121,6 +122,12 @@ function anchors(session, doc, section) {
   const s = doc.sections[section]; if (!doc.book || !s?.href) return Promise.resolve([]);
   return new Promise(resolve => { const child = spawn('python3', [path.join(__dirname,'extract.py'),'--anchors',path.join(userDir(session),'books',doc.id,...s.href.split('/'))], { stdio: ['ignore','pipe','ignore'] }); const parts = []; child.stdout.on('data', x => parts.push(x)); child.on('error', () => resolve([])); child.on('close', () => { try { resolve(JSON.parse(Buffer.concat(parts))); } catch { resolve([]); } }); });
 }
+const anchorCache = new Map(); // doc+section+version → anchors promise (one python run per chapter)
+function anchorsCached(session, doc, section) { const k = doc.id + ':' + section + ':' + doc.updated; if (!anchorCache.has(k)) { if (anchorCache.size > 60) anchorCache.clear(); anchorCache.set(k, anchors(session, doc, section)); } return anchorCache.get(k); }
+// The reader counts positions over its passages (chunks.js: trimmed, no paragraph breaks); Kavita mapping works on the section text.
+function chunkMap(text) { const out = []; let at = 0, sum = 0; for (const c of chunks(text)) { const i = text.indexOf(c, at), t = i < 0 ? at : i; out.push({ t, c: sum, len: c.length }); at = t + c.length; sum += c.length; } return out; }
+function toText(text, pos) { let r = { t: 0, c: 0, len: 0 }; for (const x of chunkMap(text)) if (x.c <= pos) r = x; return r.t + Math.max(0, Math.min(pos - r.c, r.len)); }
+function toChunk(text, pos) { let r = { t: 0, c: 0, len: 0 }; for (const x of chunkMap(text)) if (x.t <= pos) r = x; return r.c + Math.max(0, Math.min(pos - r.t, r.len)); }
 const anchorKey = s => s.replace(/\s+/g,'').toLowerCase().slice(0,30);
 const paraStarts = text => { const out = []; for (let i = 0; i < text.length; i = text.indexOf('\n', i) + 1 || text.length) if (text[i] !== '\n') out.push(i); return out; };
 const paraAt = (text, position) => paraStarts(text).filter(p => p <= position).pop() || 0;
@@ -130,11 +137,20 @@ function toXpath(list, text, position) {
   const hits = list.filter(a => anchorKey(a.text) && (anchorKey(a.text).startsWith(want) || want.startsWith(anchorKey(a.text))));
   return (hits[nth] || hits[hits.length - 1])?.xpath || null;
 }
-function fromXpath(list, text, xpath) {
-  let i = list.findIndex(a => a.xpath === xpath || a.idpath === xpath); if (i < 0) i = list.findIndex(a => a.xpath.startsWith(xpath + '/') || a.idpath?.startsWith(xpath + '/')); if (i < 0) return 0;
+function fromXpath(list, text, xpath, selected = '') {
+  // Exact block; else the first block inside it (Kavita saved a container); else the block that contains it (a span in a paragraph).
+  let i = list.findIndex(a => a.xpath === xpath || a.idpath === xpath); if (i < 0) i = list.findIndex(a => a.xpath.startsWith(xpath + '/') || a.idpath?.startsWith(xpath + '/'));
+  if (i < 0) { let best = -1; list.forEach((a, k) => { if ((xpath.startsWith(a.xpath + '/') || (a.idpath && xpath.startsWith(a.idpath + '/'))) && (best < 0 || a.xpath.length > list[best].xpath.length)) best = k; }); i = best; }
+  if (i < 0) return findSelected(text, selected, 0);
   const want = anchorKey(list[i].text); const nth = list.slice(0, i).filter(a => anchorKey(a.text) === want).length;
   const starts = paraStarts(text).filter(p => { const k = anchorKey(text.slice(p, p + 200)); return k.startsWith(want) || want.startsWith(k); });
-  return starts[nth] ?? starts[starts.length - 1] ?? 0;
+  return findSelected(text, selected, starts[nth] ?? starts[starts.length - 1] ?? 0);
+}
+// Where a quoted passage starts, at or after `from` (whitespace-tolerant: Kavita joins inline elements without spaces).
+function findSelected(text, selected, from) { return matchSelected(text, selected, from)?.index ?? from; }
+function matchSelected(text, selected, from) {
+  const words = String(selected || '').trim().split(/\s+/).filter(Boolean).slice(0, 12); if (!words.length) return from;
+  const re = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'), 'g'); re.lastIndex = from; return re.exec(text);
 }
 const kavitaIds = new Map(); // chapter → {volumeId, seriesId, libraryId, pages}
 async function chapterIds(session, o) {
@@ -144,10 +160,10 @@ async function chapterIds(session, o) {
 // Lectoria → Kavita, once per paragraph. Reaching the last paragraph of the book marks it read (pageNum = pages).
 async function pushKavita(session, doc, p, old) {
   const s = doc.sections[p.section]; if (doc.origin?.kind !== 'kavita' || !Number.isInteger(s?.page)) return p;
-  const para = paraAt(s.text, p.position); if (old?.kavita && old.kavita.section === p.section && old.kavita.para === para) return { ...p, kavita: old.kavita };
+  const tpos = toText(s.text, p.position), para = paraAt(s.text, tpos); if (old?.kavita && old.kavita.section === p.section && old.kavita.para === para) return { ...p, kavita: old.kavita };
   try {
     const ids = await chapterIds(session, doc.origin), last = p.section === doc.sections.length - 1 && !paraStarts(s.text).some(x => x > para);
-    const page = last ? ids.pages : s.page, scroll = last ? null : toXpath(await anchors(session, doc, p.section), s.text, p.position);
+    const page = last ? ids.pages : s.page, scroll = last ? null : toXpath(await anchorsCached(session, doc, p.section), s.text, tpos);
     await kavita('/api/Reader/progress', session, { method: 'POST', signal: AbortSignal.timeout(8000), body: JSON.stringify({ volumeId: ids.volumeId, chapterId: doc.origin.chapter, pageNum: page, seriesId: ids.seriesId, libraryId: ids.libraryId, bookScrollId: scroll }) });
     return { ...p, kavita: { section: p.section, para, page, scroll } };
   } catch { return p; } // Kavita away: the next paragraph tries again
@@ -160,11 +176,85 @@ async function pullKavita(session, doc, file) {
     const k = await (await kavita('/api/Reader/get-progress?chapterId=' + doc.origin.chapter, session, { signal: AbortSignal.timeout(4000) })).json();
     if (!(Date.parse(String(k.lastModifiedUtc).replace(/Z?$/, 'Z')) > mtime) || (local.kavita?.page === k.pageNum && (local.kavita.scroll || null) === (k.bookScrollId || null))) return local;
     let section = 0; doc.sections.forEach((s, i) => { if (s.page <= k.pageNum) section = i; }); const s = doc.sections[section];
-    const position = s.page === k.pageNum && k.bookScrollId ? fromXpath(await anchors(session, doc, section), s.text, k.bookScrollId) : k.pageNum > s.page && section === doc.sections.length - 1 ? paraAt(s.text, s.text.length) : 0;
-    const p = { section, position, kavita: { section, para: paraAt(s.text, position), page: k.pageNum, scroll: k.bookScrollId || null } };
+    const tpos = s.page === k.pageNum && k.bookScrollId ? fromXpath(await anchorsCached(session, doc, section), s.text, k.bookScrollId) : k.pageNum > s.page && section === doc.sections.length - 1 ? paraAt(s.text, s.text.length) : 0;
+    const p = { section, position: toChunk(s.text, tpos), kavita: { section, para: paraAt(s.text, tpos), page: k.pageNum, scroll: k.bookScrollId || null } };
     await atomic(file, p); return p;
   } catch { return local; }
 }
+// Bookmarks and notes. Books from Kavita keep them in Kavita itself (bookmarks = its personal table of contents,
+// notes/highlights = its annotations), so both readers show the same list; other documents keep a local file.
+// Positions travel in reader coordinates (passages), like the reading progress.
+const kavitaBacked = doc => doc.origin?.kind === 'kavita' && doc.sections.some(s => Number.isInteger(s.page));
+const htmlText = h => String(h || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>\s*<p[^>]*>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim();
+const escHtml = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const quill = comment => comment ? { comment: JSON.stringify({ ops: [{ insert: comment + '\n' }] }), commentHtml: '<p>' + escHtml(comment).replace(/\n/g, '<br>') + '</p>' } : { comment: '{}', commentHtml: '' };
+const ptocId = (page, title) => 'p' + page + '-' + Buffer.from(title).toString('base64url');
+async function kavitaPlace(session, doc, page, xpath, selected) {
+  let section = -1; doc.sections.forEach((s, i) => { if (Number.isInteger(s.page) && s.page <= page) section = i; }); if (section < 0) return { section: 0, position: 0 };
+  const s = doc.sections[section]; if (s.page !== page) return { section, position: 0 };
+  const t = xpath ? fromXpath(await anchorsCached(session, doc, section), s.text, xpath, selected) : findSelected(s.text, selected, 0);
+  return { section, position: toChunk(s.text, t) };
+}
+async function listNotes(session, doc) {
+  if (!kavitaBacked(doc)) return JSON.parse(await fsp.readFile(path.join(userDir(session), doc.id + '.notes.json'), 'utf8').catch(() => '[]'));
+  const ch = doc.origin.chapter, opt = () => ({ signal: AbortSignal.timeout(8000) });
+  const [anns, ptoc] = await Promise.all([kavita('/api/annotation/all?chapterId=' + ch, session, opt()).then(r => r.json()), kavita('/api/reader/ptoc?chapterId=' + ch, session, opt()).then(r => r.json())]);
+  const notes = [];
+  for (const a of anns) notes.push({ id: 'a' + a.id, kind: 'note', ...await kavitaPlace(session, doc, a.pageNumber, a.xPath, a.selectedText), text: a.selectedText || '', comment: a.commentPlainText || htmlText(a.commentHtml), color: Math.max(0, Math.min(4, a.selectedSlotIndex || 0)), owner: a.ownerUsername || '', mine: String(a.ownerUserId) === String(session.userId), at: a.createdUtc || null });
+  for (const b of ptoc) notes.push({ id: ptocId(b.pageNumber, b.title), kind: 'bookmark', ...await kavitaPlace(session, doc, b.pageNumber, b.bookScrollId, b.selectedText), text: b.selectedText || '', comment: b.title || '', color: 0, mine: true, at: null });
+  return notes;
+}
+function validNote(doc, input) {
+  const n = { kind: input.kind === 'bookmark' ? 'bookmark' : 'note', section: input.section, position: input.position, text: String(input.text || '').slice(0, 2000), comment: String(input.comment || '').slice(0, 10000), color: Number.isInteger(input.color) && input.color >= 0 && input.color <= 4 ? input.color : 0 };
+  if (!Number.isInteger(n.section) || !doc.sections[n.section] || !Number.isInteger(n.position) || n.position < 0) throw error(400, 'Posição inválida.');
+  return n;
+}
+async function addNote(session, doc, n) {
+  if (!kavitaBacked(doc)) { const file = path.join(userDir(session), doc.id + '.notes.json'); const notes = await listNotes(session, doc); const note = { id: crypto.randomBytes(8).toString('hex'), ...n, mine: true, at: new Date().toISOString() }; notes.push(note); await atomic(file, notes); return note; }
+  const s = doc.sections[n.section]; if (!Number.isInteger(s.page)) throw error(400, 'Este capítulo não existe no Kavita.');
+  const ids = await chapterIds(session, doc.origin), tpos = toText(s.text, n.position), para = paraAt(s.text, tpos);
+  const xpath = toXpath(await anchorsCached(session, doc, n.section), s.text, tpos) || '//body';
+  const common = { libraryId: ids.libraryId, seriesId: ids.seriesId, volumeId: ids.volumeId, chapterId: doc.origin.chapter };
+  if (n.kind === 'bookmark') {
+    const title = (n.comment || n.text || s.text.slice(para, para + 80)).replace(/\s+/g, ' ').trim().slice(0, 100) || s.title;
+    await kavita('/api/reader/create-ptoc', session, { method: 'POST', signal: AbortSignal.timeout(8000), body: JSON.stringify({ ...common, pageNumber: s.page, title, bookScrollId: xpath, selectedText: n.text || '' }) });
+    return { id: ptocId(s.page, title), ...n, comment: title, mine: true, at: null };
+  }
+  const paragraph = s.text.slice(para, (s.text.indexOf('\n', para) + 1 || s.text.length + 1) - 1);
+  const a = await (await kavita('/api/annotation/create', session, { method: 'POST', signal: AbortSignal.timeout(8000), body: JSON.stringify({ id: 0, xPath: xpath, endingXPath: xpath, selectedText: n.text, ...quill(n.comment), containsSpoiler: false, pageNumber: s.page, selectedSlotIndex: n.color, chapterTitle: s.title, highlightCount: n.text.length, ownerUserId: 0, ownerUsername: '', createdUtc: '0001-01-01T00:00:00Z', lastModifiedUtc: '0001-01-01T00:00:00Z', context: paragraph.slice(0, 1000), ...common }) })).json();
+  return { id: 'a' + a.id, ...n, mine: true, at: a.createdUtc || null };
+}
+async function editNote(session, doc, id, input) {
+  const comment = String(input.comment || '').slice(0, 10000), color = Number.isInteger(input.color) && input.color >= 0 && input.color <= 4 ? input.color : null;
+  if (!kavitaBacked(doc)) { const file = path.join(userDir(session), doc.id + '.notes.json'); const notes = await listNotes(session, doc); const note = notes.find(x => x.id === id); if (!note) throw error(404, 'Nota não encontrada.'); note.comment = comment; if (color !== null) note.color = color; await atomic(file, notes); return note; }
+  if (!/^a\d+$/.test(id)) throw error(400, 'Os marcadores do Kavita não se editam: apaga e cria outro.');
+  const a = await (await kavita('/api/annotation/' + id.slice(1), session, { signal: AbortSignal.timeout(8000) })).json();
+  if (String(a.ownerUserId) !== String(session.userId)) throw error(403, 'Esta nota é de outra pessoa.');
+  await kavita('/api/annotation/update', session, { method: 'POST', signal: AbortSignal.timeout(8000), body: JSON.stringify({ ...a, ...quill(comment), ...(color !== null ? { selectedSlotIndex: color } : {}) }) });
+  return { ok: true };
+}
+async function removeNote(session, doc, id) {
+  if (!kavitaBacked(doc)) { const file = path.join(userDir(session), doc.id + '.notes.json'); const notes = await listNotes(session, doc); await atomic(file, notes.filter(x => x.id !== id)); return; }
+  const opt = { method: 'DELETE', signal: AbortSignal.timeout(8000) };
+  if (/^a\d+$/.test(id)) return void await kavita('/api/annotation?annotationId=' + id.slice(1), session, opt);
+  const m = id.match(/^p(\d+)-([A-Za-z0-9_-]*)$/); if (!m) throw error(400, 'Nota inválida.');
+  await kavita('/api/reader/ptoc?chapterId=' + doc.origin.chapter + '&pageNum=' + m[1] + '&title=' + encodeURIComponent(Buffer.from(m[2], 'base64url').toString()), session, opt);
+}
+// Word export (export_docx.py): the text with bookmarks as Word bookmarks, notes as comments, highlights in their colour.
+async function highlightColors(session) {
+  try { const p = await (await kavita('/api/users/get-preferences', session, { signal: AbortSignal.timeout(5000) })).json(); const slots = (p.bookReaderHighlightSlots || []).slice().sort((a, b) => a.slotNumber - b.slotNumber).map(x => x.color).filter(c => c && [c.r, c.g, c.b].every(Number.isFinite)).slice(0, 5); if (slots.length === 5) return slots.map(c => ({ r: c.r, g: c.g, b: c.b, a: Number.isFinite(c.a) ? c.a : 0.4 })); } catch {}
+  return [[242, 214, 92], [143, 209, 158], [127, 179, 240], [242, 155, 192], [245, 167, 108]].map(([r, g, b]) => ({ r, g, b, a: 0.45 }));
+}
+async function exportDocx(session, doc) {
+  const [notes, colors] = await Promise.all([listNotes(session, doc).catch(() => []), highlightColors(session)]);
+  const marks = notes.map(n => { const s = doc.sections[n.section]; if (!s) return null; let start = toText(s.text, n.position), end = start;
+    if (n.kind === 'note' && n.text) { const m = matchSelected(s.text, n.text, Math.max(0, start - 5)); if (m && m.index - start < 300) { start = m.index; end = m.index + m[0].length; } else end = start + n.text.length; }
+    const para = paraAt(s.text, start), c = colors[n.color || 0] || colors[0];
+    return { kind: n.kind, section: n.section, start, end, comment: n.kind === 'note' ? n.comment || '' : '', color: [c.r, c.g, c.b], label: n.kind === 'bookmark' ? (n.comment || n.text || s.text.slice(para, para + 80)).replace(/\s+/g, ' ').trim().slice(0, 120) : '', author: n.owner || session.username }; }).filter(Boolean);
+  const input = JSON.stringify({ title: doc.title, subtitle: [doc.source, 'Exportado do Lectoria a ' + new Date().toLocaleDateString('pt-PT')].filter(Boolean).join(' · '), author: session.username, sections: doc.sections.map(s => ({ title: s.title, text: s.text })), marks });
+  return await new Promise((resolve, reject) => { const child = spawn('python3', [path.join(__dirname, 'export_docx.py')], { stdio: ['pipe', 'pipe', 'ignore'] }); const parts = []; child.stdout.on('data', x => parts.push(x)); child.on('error', () => reject(error(503, 'O exportador para Word não está disponível.'))); child.on('close', code => code ? reject(error(500, 'Não foi possível criar o ficheiro Word.')) : resolve(Buffer.concat(parts))); child.stdin.end(input); });
+}
+const exportName = doc => String(doc.title || 'Documento').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '-').trim().slice(0, 120) + ' (Lectoria).docx';
 // Covers (uploaded, or copied from Kavita at import): small images under users/<u>/covers, validated by magic bytes.
 const imageType = buf => buf.length>12 && buf[0]===0xff && buf[1]===0xd8 ? 'image/jpeg' : buf.toString('ascii',1,4)==='PNG' ? 'image/png' : buf.toString('ascii',0,4)==='RIFF'&&buf.toString('ascii',8,12)==='WEBP' ? 'image/webp' : null;
 const coverFile = (s, name) => path.join(userDir(s), 'covers', name + '.img');
@@ -487,7 +577,7 @@ async function handle(req,res) {
         const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];const auto=await readJson('auto.json',{});
         await Promise.all((await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x)).map(async file=>{const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
           // Reading position (and when it was last saved) so the shelf can show progress and "continue" ordering.
-          let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const p=await pullKavita(session,d,pfile);const st=await fsp.stat(pfile);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
+          let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const p=await pullKavita(session,d,pfile);const st=await fsp.stat(pfile);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);const percent=Math.max(0,Math.min(100,Math.round((before+toText(d.sections[p.section]?.text||'',p.position))/total*100))),lastPage=d.sections[d.sections.length-1]?.page;progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent,read:percent>=99||(Number.isInteger(lastPage)&&p.kavita?.page>lastPage)};}catch{}
           docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,auto:auto[d.id]||null,progress});}));
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
       }
@@ -511,12 +601,36 @@ async function handle(req,res) {
         // Book files are untrusted markup: never scripts, never anything from outside this origin.
         return send(res,200,buf,{'Content-Type':(types[path.extname(file).toLowerCase()]||'application/octet-stream')+(/\.(x?html?|css|svg)$/i.test(file)?'; charset=utf-8':''),'Content-Security-Policy':"default-src 'self' data:; script-src 'none'; object-src 'none'; style-src 'self' 'unsafe-inline' data:; frame-ancestors 'self'",'X-Content-Type-Options':'nosniff','Cache-Control':'private, max-age=600'});
       }
+      // Highlight colours: the account's own Kavita slots, so a highlight has the same colour in both readers.
+      if(route==='/api/highlight-colors'&&req.method==='GET') return send(res,200,await highlightColors(session));
+      // Books in progress in Kavita that are not on the shelf yet ("on deck" + the chapter to continue).
+      if(route==='/api/kavita/reading'&&req.method==='GET') {
+        const opt=()=>({signal:AbortSignal.timeout(8000)});
+        const deck=await(await kavita('/api/series/on-deck?libraryId=0&pageNumber=1&pageSize=12',session,{method:'POST',body:'{}',...opt()})).json();
+        const shelf=new Set();for(const f of await fsp.readdir(userDir(session)).catch(()=>[]))if(/^[a-f0-9]{32}\.json$/.test(f))try{const d=JSON.parse(await fsp.readFile(path.join(userDir(session),f),'utf8'));if(d.origin?.kind==='kavita')shelf.add(d.origin.chapter);}catch{}
+        const out=[];for(const s of deck){try{const c=await(await kavita('/api/reader/continue-point?seriesId='+s.id,session,opt())).json();if(!c?.id||shelf.has(c.id))continue;out.push({series:s.id,chapter:c.id,title:String(s.name||'Livro').slice(0,300),percent:s.pages?Math.round((s.pagesRead||0)/s.pages*100):0,at:s.latestReadDate||null,format:s.format});}catch{}}
+        return send(res,200,out);
+      }
+      const exportMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/export(\.docx)?$/);
+      if(exportMatch) {
+        const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),exportMatch[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));
+        if(exportMatch[2]&&req.method==='GET') return send(res,200,await exportDocx(session,doc),{'Content-Type':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(exportName(doc)),'Cache-Control':'no-store'});
+        if(!exportMatch[2]&&req.method==='POST') { if(!EXPORTS) throw error(400,'Não há pasta de exportação configurada neste servidor.'); const file=path.join(EXPORTS,exportName(doc)); await fsp.mkdir(EXPORTS,{recursive:true}); await fsp.writeFile(file,await exportDocx(session,doc)); return send(res,200,{saved:file}); }
+      }
+      const notesMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/notes(?:\/([A-Za-z0-9_-]{1,200}))?$/);
+      if(notesMatch) {
+        const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),notesMatch[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));
+        if(!notesMatch[2]&&req.method==='GET') return send(res,200,await listNotes(session,doc));
+        if(!notesMatch[2]&&req.method==='POST') return send(res,201,await addNote(session,doc,validNote(doc,await json(req,20000))));
+        if(notesMatch[2]&&req.method==='PUT') return send(res,200,await editNote(session,doc,notesMatch[2],await json(req,20000)));
+        if(notesMatch[2]&&req.method==='DELETE') { await removeNote(session,doc,notesMatch[2]); return send(res,200,{ok:true}); }
+      }
       const match=route.match(/^\/api\/documents\/([a-f0-9]{32})(\/progress)?$/);
       if(match) {
         const file=path.join(userDir(session),match[1]+(match[2]?'.progress':'')+'.json');
         if(req.method==='GET') { try{const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),match[1]+'.json'),'utf8'));if(match[2]){const p=await pullKavita(session,doc,file);return send(res,200,{section:p.section,position:p.position});}return send(res,200,doc);}catch(e){if(match[2]&&e.code==='ENOENT')return send(res,200,{section:0,position:0});throw error(404,'Documento não encontrado.');} }
         if(match[2] && req.method==='PUT') { const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),match[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));const input=await json(req,1000);if(!Number.isInteger(input.section)||input.section<0||!Number.isInteger(input.position)||input.position<0||input.position>2_000_000||input.section>5000)throw error(400,'Posição inválida.');const old=await fsp.readFile(file,'utf8').then(JSON.parse).catch(()=>null);await atomic(file,await pushKavita(session,doc,{section:input.section,position:input.position},old));return send(res,200,{ok:true}); }
-        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});await fsp.rm(coverFile(session,match[1]),{force:true});await fsp.rm(path.join(userDir(session),'books',match[1]),{recursive:true,force:true});return send(res,200,{ok:true}); }
+        if(!match[2] && req.method==='DELETE') { await fsp.rm(file,{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.progress.json'),{force:true});await fsp.rm(path.join(userDir(session),match[1]+'.notes.json'),{force:true});await fsp.rm(coverFile(session,match[1]),{force:true});await fsp.rm(path.join(userDir(session),'books',match[1]),{recursive:true,force:true});return send(res,200,{ok:true}); }
       }
       return send(res,404,{error:'Pedido não encontrado.'});
     }

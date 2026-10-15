@@ -39,3 +39,11 @@ class Extraction(unittest.TestCase):
    p=pathlib.Path(d)/'sample.docx'
    with zipfile.ZipFile(p,'w')as z:z.writestr('word/document.xml','<w:document xmlns:w="urn:test"><w:p><w:r><w:t>Olá Portugal.</w:t></w:r></w:p></w:document>')
    self.assertEqual(extract(str(p),'sample.docx')['sections'][0]['text'],'Olá Portugal.')
+
+class AnchorsTest(unittest.TestCase):
+    def test_xpaths_match_kavita(self):
+        from extract import Anchors
+        a = Anchors(); a.feed('<html><body><div id="c"><p>Um <span>dois</span></p><p> </p><p>Três</p></div><h2>Fim</h2><br/><p>Último</p></body></html>')
+        self.assertEqual([(x['xpath'], x['idpath'], x['text']) for x in a.result()], [
+            ('//body/div[1]/p[1]', 'id("c")/p[1]', 'Um dois'), ('//body/div[1]/p[3]', 'id("c")/p[3]', 'Três'),
+            ('//body/h2[1]', None, 'Fim'), ('//body/p[1]', None, 'Último')])

@@ -3,7 +3,7 @@ let upstream,server,base,temp;
 function wav(seconds,rate=22050){const data=Buffer.alloc(Math.round(seconds*rate)*2);const h=Buffer.alloc(44);h.write('RIFF',0);h.writeUInt32LE(36+data.length,4);h.write('WAVEfmt ',8);h.writeUInt32LE(16,16);h.writeUInt16LE(1,20);h.writeUInt16LE(1,22);h.writeUInt32LE(rate,24);h.writeUInt32LE(rate*2,28);h.writeUInt16LE(2,32);h.writeUInt16LE(16,34);h.write('data',36);h.writeUInt32LE(data.length,40);return Buffer.concat([h,data]);}
 let voiceCalls=0;
 // Kavita's reader endpoints for the shared reading position; `kv.book` is served as chapter 50 of series 7.
-const kv={progress:null,book:null};
+const kv={progress:null,book:null,anns:[],ptoc:[]};
 function fakeKavita(req,res,input){const u=new URL(req.url,'http://x');const out=x=>{res.end(JSON.stringify(x));return true;};
   if(u.pathname==='/api/Download/chapter'){res.setHeader('Content-Disposition','attachment; filename="b.epub"');res.setHeader('Content-Type','application/epub+zip');res.end(kv.book);return true;}
   if(u.pathname==='/api/Series/chapter')return out({id:50,volumeId:9,pages:3,lastModifiedUtc:'2000-01-01T00:00:00'});
@@ -11,6 +11,17 @@ function fakeKavita(req,res,input){const u=new URL(req.url,'http://x');const out
   if(u.pathname==='/api/Series/7')return out({id:7,libraryId:3});
   if(u.pathname==='/api/Reader/get-progress')return out(kv.progress||{volumeId:0,chapterId:50,pageNum:0,seriesId:0,libraryId:0,bookScrollId:null,lastModifiedUtc:'0001-01-01T00:00:00'});
   if(u.pathname==='/api/Reader/progress'){kv.progress={...input,lastModifiedUtc:new Date().toISOString().replace('Z','')};return out({});}
+  if(u.pathname==='/api/annotation/create'){const a={...input,id:kv.anns.length+10,ownerUserId:1,ownerUsername:'alice',commentPlainText:String(input.commentHtml||'').replace(/<[^>]+>/g,''),createdUtc:'2026-10-15T10:00:00'};kv.anns.push(a);return out(a);}
+  if(u.pathname==='/api/annotation/all')return out(kv.anns);
+  if(u.pathname==='/api/annotation/update'){const i=kv.anns.findIndex(a=>a.id===input.id);kv.anns[i]={...input,commentPlainText:String(input.commentHtml||'').replace(/<[^>]+>/g,'')};return out({});}
+  if(/^\/api\/annotation\/\d+$/.test(u.pathname))return out(kv.anns.find(a=>a.id===Number(u.pathname.split('/').pop())));
+  if(u.pathname==='/api/annotation'&&req.method==='DELETE'){kv.anns=kv.anns.filter(a=>a.id!==Number(u.searchParams.get('annotationId')));return out({});}
+  if(u.pathname==='/api/reader/create-ptoc'){kv.ptoc.push({...input});return out({});}
+  if(u.pathname==='/api/reader/ptoc'&&req.method==='DELETE'){kv.ptoc=kv.ptoc.filter(b=>!(b.pageNumber===Number(u.searchParams.get('pageNum'))&&b.title===u.searchParams.get('title')));return out({});}
+  if(u.pathname==='/api/reader/ptoc')return out(kv.ptoc);
+  if(u.pathname==='/api/users/get-preferences')return out({bookReaderHighlightSlots:[0,1,2,3,4].map(i=>({slotNumber:i,color:{r:i*50,g:200,b:10,a:.4}}))});
+  if(u.pathname==='/api/series/on-deck')return out([{id:7,name:'Partilhado',pages:3,pagesRead:1},{id:8,name:'Outro livro',pages:10,pagesRead:4,latestReadDate:'2026-10-14T10:00:00'}]);
+  if(u.pathname==='/api/reader/continue-point')return out({id:u.searchParams.get('seriesId')==='7'?50:60});
   return false;}
 before(async()=>{temp=await fs.mkdtemp(path.join(os.tmpdir(),'lectoria-test-'));process.env.LECTORIA_DATA=temp;process.env.LECTORIA_PYTHON='';process.env.LECTORIA_CLOUD_DIR=path.join(temp,'cloud');process.env.LECTORIA_VOICE_KEY_FILE=path.join(temp,'key');process.env.LECTORIA_CACHE_DIR=path.join(temp,'cache');await fs.writeFile(path.join(temp,'key'),'k'.repeat(40));upstream=http.createServer(async(req,res)=>{let text='';for await(const c of req)text+=c;const input=JSON.parse(text||'{}');if(fakeKavita(req,res,input))return;res.setHeader('Content-Type','application/json');if(req.url==='/api/voice/status')return res.end(JSON.stringify({available:true,voices:[{id:'pt_PT-tugao',name:'Tugão · Português de Portugal',lang:'pt-PT'}]}));if(req.url==='/api/voice'){voiceCalls++;if(req.headers['x-voice-bridge']!=='k'.repeat(40)){res.writeHead(401);return res.end('{}');}res.setHeader('Content-Type','audio/wav');return res.end(wav(0.1));}if(req.url.startsWith('/feeds/posts/summary'))return res.end(JSON.stringify({feed:{title:{$t:'Blogue de teste'}}}));if(req.url.startsWith('/feeds/posts/default/25919755497274437'))return res.end(JSON.stringify({entry:{id:{$t:'tag:blogger.com,1999:blog-1.post-25919755497274437'},title:{$t:'Um artigo'},content:{$t:'<p>Primeiro parágrafo.</p><script>alert(1)</script><p>Segundo parágrafo.</p>'}}}));if(req.url.startsWith('/feeds/posts/default'))return res.end(JSON.stringify({feed:{title:{$t:'Blogue de teste'},'openSearch$totalResults':{$t:'1'},entry:[{id:{$t:'tag:blogger.com,1999:blog-1.post-25919755497274437'},title:{$t:'Um artigo'},published:{$t:'2026-10-08T01:00:00Z'},link:[{rel:'alternate',href:'http://blog/x'}],content:{$t:'<p>Olá</p><img src="https://blogartifex.example/media/a.jpg">'},'media$thumbnail':{url:'https://blogger.googleusercontent.com/img/s72-c/capa.jpg'}},{id:{$t:'tag:blogger.com,1999:blog-1.post-2'},title:{$t:'Sem imagem'},content:{$t:'<p>Só texto</p><img src="javascript:alert(1)">'}}]}}));if(req.url.startsWith('/api/image/series-cover')){res.setHeader('Content-Type','image/png');return res.end(new URL(req.url,'http://x').searchParams.get('apiKey')==='key-'+'alice'?Buffer.from('PNGDATA'):'');}if(req.url==='/api/Account/login'){if(input.password!=='correct'){res.writeHead(401);return res.end('{}');}res.end(JSON.stringify({apiKey:'key-'+input.username,id:input.username==='alice'?1:2,username:input.username,token:'test.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+14*86400})).toString('base64url')+'.signature'}));}else{res.end('[]');}});await new Promise(r=>upstream.listen(0,'127.0.0.1',r));process.env.LECTORIA_KAVITA_URL='http://127.0.0.1:'+upstream.address().port;process.env.LECTORIA_VOICE_URL=process.env.LECTORIA_KAVITA_URL;process.env.LECTORIA_BLOGS=process.env.LECTORIA_KAVITA_URL;const{handle}=require('../server');server=http.createServer(handle);await new Promise(r=>server.listen(0,'127.0.0.1',r));base='http://127.0.0.1:'+server.address().port;});
 after(async()=>{await new Promise(r=>server.close(r));await new Promise(r=>upstream.close(r));await fs.rm(temp,{recursive:true,force:true});});
@@ -76,16 +87,58 @@ z.close();sys.stdout.buffer.write(b.getvalue())`]);
   const doc = await (await fetch(base + '/api/import-book', { method: 'POST', headers, body: JSON.stringify({ chapter: 50, series: 7, title: 'Partilhado' }) })).json();
   assert.deepEqual(doc.sections.map(s => s.page), [1, 2]);
   const put = p => fetch(base + `/api/documents/${doc.id}/progress`, { method: 'PUT', headers, body: JSON.stringify(p) });
-  const text = doc.sections[0].text;
-  assert.equal((await put({ section: 0, position: text.indexOf('segundo') })).status, 200);
+  const { chunks } = require('../public/chunks.js'); const at = (s, word) => chunks(doc.sections[s].text).join('').indexOf(word); const text = doc.sections[0].text;
+  assert.equal((await put({ section: 0, position: at(0, 'segundo') })).status, 200);
   assert.deepEqual({ ...kv.progress, lastModifiedUtc: undefined }, { volumeId: 9, chapterId: 50, pageNum: 1, seriesId: 7, libraryId: 3, bookScrollId: '//body/div[1]/p[1]', lastModifiedUtc: undefined });
-  await put({ section: 1, position: doc.sections[1].text.indexOf('Fim') });
+  await put({ section: 1, position: at(1, 'Fim') });
   assert.equal(kv.progress.pageNum, 3); // last paragraph of the book: read
   // Read further in Kavita's own reader: Lectoria opens there.
   kv.progress = { ...kv.progress, pageNum: 1, bookScrollId: '//body/div[1]/p[2]', lastModifiedUtc: new Date(Date.now() + 5000).toISOString().replace('Z', '') };
-  assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 0, position: text.indexOf('Três') });
+  assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 0, position: at(0, 'Três') });
   kv.progress = { ...kv.progress, pageNum: 3, bookScrollId: null, lastModifiedUtc: new Date(Date.now() + 10000).toISOString().replace('Z', '') };
-  assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 1, position: doc.sections[1].text.indexOf('Fim') });
+  assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 1, position: at(1, 'Fim') });
   const listed = (await (await fetch(base + '/api/documents', { headers: { Cookie } })).json()).find(d => d.id === doc.id);
-  assert.equal(listed.progress.section, 1);
+  assert.equal(listed.progress.section, 1); assert.equal(listed.progress.read, true);
+  // Bookmarks and notes live in Kavita: personal table of contents + annotations, at the paragraph's xpath.
+  const notes = p => fetch(base + `/api/documents/${doc.id}/notes` + (p || ''), { headers });
+  const post = n => fetch(base + `/api/documents/${doc.id}/notes`, { method: 'POST', headers, body: JSON.stringify(n) }).then(r => r.json());
+  const note = await post({ kind: 'note', section: 0, position: at(0, 'segundo'), text: 'segundo', comment: 'Linha 1\nLinha <2>', color: 3 });
+  assert.match(note.id, /^a\d+$/);
+  const ann = kv.anns[0];
+  assert.equal(ann.xPath, '//body/div[1]/p[1]'); assert.equal(ann.pageNumber, 1); assert.equal(ann.selectedSlotIndex, 3); assert.equal(ann.chapterId, 50); assert.equal(ann.libraryId, 3);
+  assert.deepEqual(JSON.parse(ann.comment), { ops: [{ insert: 'Linha 1\nLinha <2>\n' }] }); assert.equal(ann.commentHtml, '<p>Linha 1<br>Linha &lt;2&gt;</p>');
+  const mark = await post({ kind: 'bookmark', section: 0, position: at(0, 'Três'), text: '' });
+  assert.equal(kv.ptoc[0].bookScrollId, '//body/div[1]/p[2]'); assert.equal(kv.ptoc[0].title, 'Três, terceiro.');
+  // Made in Kavita's own reader (a span inside the paragraph): placed on the quoted words.
+  kv.anns.push({ id: 99, xPath: '//body/div[1]/p[2]/span[1]', selectedText: 'terceiro', pageNumber: 1, selectedSlotIndex: 1, commentPlainText: 'do Kavita', ownerUserId: 2, ownerUsername: 'bob' });
+  let list = await (await notes()).json();
+  assert.deepEqual(list.map(n => [n.kind, n.section, n.position, n.mine]), [['note', 0, at(0, 'segundo'), true], ['note', 0, at(0, 'terceiro'), false], ['bookmark', 0, at(0, 'Três'), true]]);
+  assert.equal((await fetch(base + `/api/documents/${doc.id}/notes/a99`, { method: 'PUT', headers, body: JSON.stringify({ comment: 'x' }) })).status, 403);
+  assert.equal((await fetch(base + `/api/documents/${doc.id}/notes/${note.id}`, { method: 'PUT', headers, body: JSON.stringify({ comment: 'Mudada', color: 0 }) })).status, 200);
+  assert.equal(kv.anns[0].commentPlainText, 'Mudada'); assert.equal(kv.anns[0].selectedSlotIndex, 0);
+  for (const id of [note.id, mark.id]) assert.equal((await fetch(base + `/api/documents/${doc.id}/notes/${id}`, { method: 'DELETE', headers })).status, 200);
+  assert.deepEqual(kv.ptoc, []); assert.deepEqual(kv.anns.map(a => a.id), [99]);
+  // Highlight colours come from the account's Kavita slots; "A ler no Kavita" leaves out books already on the shelf.
+  assert.deepEqual((await (await fetch(base + '/api/highlight-colors', { headers })).json())[1], { r: 50, g: 200, b: 10, a: 0.4 });
+  assert.deepEqual((await (await fetch(base + '/api/kavita/reading', { headers })).json()).map(b => [b.series, b.chapter, b.percent]), [[8, 60, 40]]);
+});
+
+test('keeps bookmarks and notes of local documents in the account', async () => {
+  const Cookie = await login('alice'), headers = { Cookie, 'Content-Type': 'application/json' };
+  const doc = await (await fetch(base + '/api/documents', { method: 'POST', headers, body: JSON.stringify({ title: 'Local', sections: [{ title: 'A', text: 'Um texto local.' }] }) })).json();
+  const n = await (await fetch(base + `/api/documents/${doc.id}/notes`, { method: 'POST', headers, body: JSON.stringify({ kind: 'note', section: 0, position: 3, text: 'texto', comment: 'c', color: 9 }) })).json();
+  assert.equal(n.color, 0); assert.equal((await fetch(base + `/api/documents/${doc.id}/notes`, { method: 'POST', headers, body: JSON.stringify({ kind: 'note', section: 4, position: 0 }) })).status, 400);
+  await fetch(base + `/api/documents/${doc.id}/notes/${n.id}`, { method: 'PUT', headers, body: JSON.stringify({ comment: 'nova', color: 2 }) });
+  assert.deepEqual((await (await fetch(base + `/api/documents/${doc.id}/notes`, { headers })).json()).map(x => [x.comment, x.color]), [['nova', 2]]);
+  assert.equal((await fetch(base + `/api/documents/${doc.id}/notes`, { headers: { Cookie: await login('bob') } })).status, 404);
+  // Word export: bookmark as a Word bookmark, note as a Word comment over the quoted words, highlight shading.
+  await fetch(base + `/api/documents/${doc.id}/notes`, { method: 'POST', headers, body: JSON.stringify({ kind: 'bookmark', section: 0, position: 0, text: '' }) });
+  const docx = await fetch(base + `/api/documents/${doc.id}/export.docx`, { headers: { Cookie } });
+  assert.equal(docx.status, 200); assert.match(docx.headers.get('content-disposition'), /Local%20\(Lectoria\)\.docx/);
+  const parts = JSON.parse(require('node:child_process').execFileSync('python3', ['-c', 'import zipfile,io,sys,json;z=zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()));print(json.dumps({n:z.read(n).decode() for n in ["word/document.xml","word/comments.xml"]}))'], { input: Buffer.from(await docx.arrayBuffer()) }));
+  assert.match(parts['word/document.xml'], /<w:bookmarkStart w:id="\d+" w:name="M\d\d_Um_texto_local"\/>/);
+  assert.match(parts['word/document.xml'], /<w:commentRangeStart w:id="(\d+)"\/><w:r><w:rPr><w:shd [^>]*w:fill="[0-9A-F]{6}"\/><\/w:rPr><w:t xml:space="preserve">texto<\/w:t><\/w:r><w:commentRangeEnd w:id="\1"\/>/);
+  assert.match(parts['word/comments.xml'], /w:author="alice"[^>]*>.*nova/);
+  assert.equal((await fetch(base + `/api/documents/${doc.id}/export`, { method: 'POST', headers, body: '{}' })).status, 400); // no export folder configured here
+  await fetch(base + `/api/documents/${doc.id}`, { method: 'DELETE', headers });
 });
