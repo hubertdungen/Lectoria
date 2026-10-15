@@ -355,6 +355,7 @@ async function jobChunk(job,text,key) {
 async function runJob(job,file) {
   const dir=path.dirname(file), base=path.join(dir,job.id), key=(await fsp.readFile(KEY,'utf8')).trim();
   let doc; try { doc=JSON.parse(await fsp.readFile(path.join(dir,'..',job.doc+'.json'),'utf8')); } catch { throw new Error('O documento já não está na estante.'); }
+  job.total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { job.total.chunks++; job.total.chars+=c.length; } // the book may have changed since the job was queued
   await fsp.rm(base+'.pcm',{force:true}); const out=fs.createWriteStream(base+'.pcm',{mode:0o600});
   const write=buffer=>new Promise((resolve,reject)=>out.write(buffer,e=>e?reject(e):resolve()));
   let rate=0,channels=1,bytes=0; const st=await stats(); job.chapters=[];
