@@ -84,6 +84,8 @@ z.close();sys.stdout.buffer.write(b.getvalue())`]);
   // Read further in Kavita's own reader: Lectoria opens there.
   kv.progress = { ...kv.progress, pageNum: 1, bookScrollId: '//body/div[1]/p[2]', lastModifiedUtc: new Date(Date.now() + 5000).toISOString().replace('Z', '') };
   assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 0, position: text.indexOf('Três') });
+  kv.progress = { ...kv.progress, pageNum: 3, bookScrollId: null, lastModifiedUtc: new Date(Date.now() + 10000).toISOString().replace('Z', '') };
+  assert.deepEqual(await (await fetch(base + `/api/documents/${doc.id}/progress`, { headers: { Cookie } })).json(), { section: 1, position: doc.sections[1].text.indexOf('Fim') });
   const listed = (await (await fetch(base + '/api/documents', { headers: { Cookie } })).json()).find(d => d.id === doc.id);
-  assert.equal(listed.progress.section, 0);
+  assert.equal(listed.progress.section, 1);
 });

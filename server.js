@@ -160,7 +160,7 @@ async function pullKavita(session, doc, file) {
     const k = await (await kavita('/api/Reader/get-progress?chapterId=' + doc.origin.chapter, session, { signal: AbortSignal.timeout(4000) })).json();
     if (!(Date.parse(String(k.lastModifiedUtc).replace(/Z?$/, 'Z')) > mtime) || (local.kavita?.page === k.pageNum && (local.kavita.scroll || null) === (k.bookScrollId || null))) return local;
     let section = 0; doc.sections.forEach((s, i) => { if (s.page <= k.pageNum) section = i; }); const s = doc.sections[section];
-    const position = s.page === k.pageNum && k.bookScrollId ? fromXpath(await anchors(session, doc, section), s.text, k.bookScrollId) : 0;
+    const position = s.page === k.pageNum && k.bookScrollId ? fromXpath(await anchors(session, doc, section), s.text, k.bookScrollId) : k.pageNum > s.page && section === doc.sections.length - 1 ? paraAt(s.text, s.text.length) : 0;
     const p = { section, position, kavita: { section, para: paraAt(s.text, position), page: k.pageNum, scroll: k.bookScrollId || null } };
     await atomic(file, p); return p;
   } catch { return local; }
@@ -308,7 +308,7 @@ async function tick() {
 async function importKavita(session,chapter,series,title) {
   const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
   const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
-  const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));
+  const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));kavitaIds.delete(chapter);
   if(title)doc.title=String(title).slice(0,300); doc.source='Kavita'; doc.origin={kind:'kavita',chapter,series}; const cover=await kavitaCover(session,series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return saved;
 }
 async function importPost(session,blog,post,entry) {
@@ -485,10 +485,10 @@ async function handle(req,res) {
       if(route==='/api/documents' && req.method==='POST')return send(res,201,await saveDoc(session,await json(req,12_000_000)));
       if(route==='/api/documents' && req.method==='GET') {
         const dir=userDir(session);await fsp.mkdir(dir,{recursive:true,mode:0o700});const docs=[];const auto=await readJson('auto.json',{});
-        for(const file of (await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))) {const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
+        await Promise.all((await fsp.readdir(dir)).filter(x=>/^[a-f0-9]{32}\.json$/.test(x)).map(async file=>{const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const total=d.sections.reduce((n,s)=>n+s.text.length,0)||1;
           // Reading position (and when it was last saved) so the shelf can show progress and "continue" ordering.
           let progress=null;try{const pfile=path.join(dir,d.id+'.progress.json');const p=await pullKavita(session,d,pfile);const st=await fsp.stat(pfile);const before=d.sections.slice(0,p.section).reduce((n,s)=>n+s.text.length,0);progress={section:p.section,position:p.position,at:st.mtime.toISOString(),percent:Math.max(0,Math.min(100,Math.round((before+p.position)/total*100)))};}catch{}
-          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,auto:auto[d.id]||null,progress});}
+          docs.push({id:d.id,title:d.title,source:d.source,updated:d.updated,sections:d.sections.length,chars:total,cover:d.cover||null,origin:d.origin||null,auto:auto[d.id]||null,progress});}));
         return send(res,200,docs.sort((a,b)=>b.updated.localeCompare(a.updated)));
       }
       const coverMatch=route.match(/^\/api\/(documents|playlists)\/([a-f0-9]{32})\/cover$/);
