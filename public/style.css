@@ -209,3 +209,16 @@ body.book-paged #book-frame{clip-path:inset(0 2px)}
 .player.mini::before{content:"";position:absolute;left:0;top:-1px;height:2px;width:var(--p,0%);background:var(--accent)}
 .player.mini .player-info{width:auto!important;min-width:0!important}
 .player.mini .player-center,.player.mini .playback-buttons{min-width:0!important;width:auto!important;flex:0 0 auto!important;padding:0!important}
+.job-detail{margin:6px 0 0;font-size:12px;color:var(--muted);line-height:1.5}
+.job-chapters{margin:6px 0 2px;font-size:12px}
+.job-chapters summary{cursor:pointer;color:var(--accent);padding:4px 0}
+.job-chapters ol{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:4px;max-height:320px;overflow:auto}
+.job-chapters li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:center;padding:4px 8px;border-radius:6px;background:var(--wash)}
+.job-chapters .jc-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job-chapters .jc-state{color:var(--muted);font-variant-numeric:tabular-nums}
+.job-chapters li.ready .jc-state{color:var(--accent)}
+.job-chapters li.now{outline:1px solid var(--accent)}
+.job-chapters li.now .jc-state{color:var(--accent);font-weight:600}
+.job-chapters .jc-bar{grid-column:1/-1;height:3px;border-radius:2px;background:color-mix(in srgb,var(--text) 12%,transparent);overflow:hidden}
+.job-chapters .jc-bar span{display:block;height:100%;background:var(--accent)}
+.library-toolbar>label{min-width:0}.library-toolbar input,.library-toolbar select{max-width:100%;min-width:0;box-sizing:border-box}

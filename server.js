@@ -291,8 +291,10 @@ async function listJobs(s) {
   return jobs.sort((a,b)=>b.created.localeCompare(a.created));
 }
 // Partial recording: how many passages of a document already sit in the disk cache for a voice and speed.
+// Chapters and pages of a document, for the progress shown in Áudios (pages = Kavita's: EPUB counts from 0, PDF from 1).
+function bookShape(doc){const pages=doc.sections.filter(s=>Number.isInteger(s.page)).map(s=>s.page);return {sections:doc.sections.length,...(pages.length?{pages:Math.max(...pages)+(doc.book?1:0)}:{})};}
 // Characters of a document still to be made with a voice and speed (the rest is in the passage cache): what an estimate should count.
-async function uncached(doc,voice,rate){let chars=0,total=0;for(const section of doc.sections)for(const text of chunks(section.text)){total+=text.length;if(!await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false))chars+=text.length;}return {chars,total};}
+async function uncached(doc,voice,rate,perChapter=false){let chars=0,total=0;const per=[];for(const section of doc.sections){const c={title:section.title,chars:0,left:0};for(const text of chunks(section.text)){total+=text.length;c.chars+=text.length;if(!await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false)){chars+=text.length;c.left+=text.length;}}per.push(c);}return perChapter?{chars,total,chapters:per}:{chars,total};}
 async function coverage(doc,voice,rate){let done=0,total=0;for(const section of doc.sections)for(const text of chunks(section.text)){total++;if(await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false))done++;}return {done,total};}
 async function autoCompile(s,docId,voice,rate){
   try{
@@ -357,13 +359,14 @@ async function jobChunk(job,text,key) {
 async function runJob(job,file) {
   const dir=path.dirname(file), base=path.join(dir,job.id), key=(await fsp.readFile(KEY,'utf8')).trim();
   let doc; try { doc=JSON.parse(await fsp.readFile(path.join(dir,'..',job.doc+'.json'),'utf8')); } catch { throw new Error('O documento já não está na estante.'); }
-  job.todo=(await uncached(doc,job.voice,job.rate)).chars;
+  job.todo=(await uncached(doc,job.voice,job.rate)).chars; Object.assign(job,bookShape(doc));
   job.total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { job.total.chunks++; job.total.chars+=c.length; } // the book may have changed since the job was queued
   await fsp.rm(base+'.pcm',{force:true}); const out=fs.createWriteStream(base+'.pcm',{mode:0o600});
   const write=buffer=>new Promise((resolve,reject)=>out.write(buffer,e=>e?reject(e):resolve()));
   let rate=0,channels=1,bytes=0; const st=await stats(); job.chapters=[];
   try {
-    for(const section of doc.sections) {
+    for(const [index,section] of doc.sections.entries()) {
+      job.at={section:index,title:section.title,...(Number.isInteger(section.page)?{page:section.page+(doc.book?1:0)}:{})};
       job.chapters.push({title:section.title,seconds:rate?bytes/(rate*channels*2):0});
       for(const text of chunks(section.text)) {
         // Live listening has priority over background jobs (jobChunk waits, and a live request interrupts it);
@@ -564,7 +567,8 @@ async function handle(req,res) {
         // ?voice=&rate= adds the partial-recording coverage of every shelf document for that voice.
         const partial={};const voice=url.searchParams.get('voice'),rate=Number(url.searchParams.get('rate'));
         if(voice&&rate){const dir=userDir(session);for(const file of (await fsp.readdir(dir).catch(()=>[])).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))){try{const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const c=await coverage(d,voice,rate);if(c.done)partial[d.id]={...c,title:d.title,cover:d.cover||null};}catch{}}}
-        const jobs=await listJobs(session);for(const j of jobs)if(j.status==='queued'){try{const d=JSON.parse(await fsp.readFile(path.join(userDir(session),j.doc+'.json'),'utf8'));j.todo=(await uncached(d,j.voice,j.rate)).chars;j.eta=Math.round(j.todo/speed(st,j.voice));}catch{}}
+        // Jobs still to finish: what is left now (the cache fills while it runs) and the state of every chapter.
+        const jobs=await listJobs(session);for(const j of jobs)if(['queued','running'].includes(j.status)){try{const d=JSON.parse(await fsp.readFile(path.join(userDir(session),j.doc+'.json'),'utf8'));const u=await uncached(d,j.voice,j.rate,true);j.byChapter=u.chapters.map(c=>[c.title,c.chars,c.left]);Object.assign(j,bookShape(d));if(j.status==='queued'){j.todo=u.chars;j.eta=Math.round(j.todo/speed(st,j.voice));}}catch{}}
         return send(res,200,{jobs,speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD,partial});
       }
       if(route==='/api/jobs' && req.method==='POST')return send(res,201,await createJob(session,await json(req,4000)));
