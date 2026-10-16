@@ -338,7 +338,7 @@ async function synthesizeChunk(text,voice,rate,key,signal) {
   const cached=await readCache(voiceKey(text,voice,rate)); if(cached)return {...pcm(cached),cached:true};
   for(let attempt=0;;attempt++) {
     try {
-      const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(300000)]):AbortSignal.timeout(300000)});
+      const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(900000)]):AbortSignal.timeout(900000)}); // throttled passages can take minutes
       if(response.status===429) { await sleep(3000); continue; }
       if(!response.ok) throw new Error('synthesis-failed');
       const wav=await boundedResponse(response,20_000_000); writeCache(voiceKey(text,voice,rate),wav); return pcm(wav);
@@ -413,8 +413,62 @@ async function tick() {
   }
   candidates.sort((a,b)=>(b.job.priority||0)-(a.job.priority||0)||a.job.startAt.localeCompare(b.job.startAt)||a.job.created.localeCompare(b.job.created));
   if(!candidates.length) return;
-  const {job,file}=candidates[0]; running.job=job; if(running.yieldTo===job.id) running.yieldTo=null;
-  try { job.status='running'; job.started=job.started||new Date().toISOString(); job.done={chunks:0,chars:0}; /* a job resumed after a restart starts over; finished passages come from the cache */ await atomic(file,job); await runJob(job,file); } catch {} finally { running.job=null; running.cancelled.delete(job.id); }
+  const {job,file}=candidates[0]; running.job=job; running.since=running.since||Date.now(); if(running.yieldTo===job.id) running.yieldTo=null;
+  try { job.status='running'; job.started=job.started||new Date().toISOString(); job.done={chunks:0,chars:0}; /* a job resumed after a restart starts over; finished passages come from the cache */ await atomic(file,job); await runJob(job,file); } catch {} finally { running.job=null; running.cancelled.delete(job.id); setTimeout(()=>{ if(!running.job) running.since=0; },15000); }
+}
+// CPU and temperature governor for full-audio jobs. The voice engine (BlogArtifex) runs in a systemd user scope;
+// every 5 s, while a job runs, its CPUQuota is set from: time the jobs have been running (cap after N minutes), what
+// other programs use (they keep headroom), and the processor temperature (stepped down above the target, up again
+// below it). Live listening lifts the limits. Settings live in <DATA>/governor.json.
+const GOV_FILE = path.join(DATA, 'governor.json'), CPUS = os.cpus().length;
+const GOV_DEFAULTS = { enabled: true, afterMinutes: 60, capPercent: 50, yieldOthers: true, tempTarget: 80 };
+const gov = { settings: { ...GOV_DEFAULTS }, applied: null, quota: null, temp: null, rawTemp: null, others: null, engine: null, reasons: [], last: null, pid: null, history: [] };
+try { Object.assign(gov.settings, JSON.parse(fs.readFileSync(GOV_FILE, 'utf8'))); } catch {}
+function cpuTemp() {
+  // Hottest of the package/core sensors (coretemp or x86_pkg_temp), in °C.
+  let best = null;
+  try { for (const h of fs.readdirSync('/sys/class/hwmon')) { const dir = path.join('/sys/class/hwmon', h); let name = ''; try { name = fs.readFileSync(path.join(dir, 'name'), 'utf8').trim(); } catch {} if (!/coretemp|k10temp|zenpower|cpu_thermal/.test(name)) continue; for (const f of fs.readdirSync(dir)) if (/^temp\d+_input$/.test(f)) { const t = Number(fs.readFileSync(path.join(dir, f), 'utf8')) / 1000; if (t > 0 && t < 130 && (best === null || t > best)) best = t; } } } catch {}
+  if (best === null) try { for (const z of fs.readdirSync('/sys/class/thermal')) { const type = fs.readFileSync(path.join('/sys/class/thermal', z, 'type'), 'utf8').trim(); if (type === 'x86_pkg_temp') best = Number(fs.readFileSync(path.join('/sys/class/thermal', z, 'temp'), 'utf8')) / 1000; } } catch {}
+  return best;
+}
+function enginePid() { let found = null; try { for (const p of fs.readdirSync('/proc')) { if (!/^\d+$/.test(p)) continue; try { if (!fs.readFileSync('/proc/' + p + '/cmdline', 'utf8').includes('voice/worker.py')) continue; const ppid = Number(fs.readFileSync('/proc/' + p + '/stat', 'utf8').split(') ')[1].split(' ')[1]); if (ppid !== 1) return Number(p); found = found || Number(p); } catch {} } } catch {} return found; } // an orphan left by a BlogArtifex restart only if nothing else
+function cpuTimes(pid) {
+  const all = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0].trim().split(/\s+/).slice(1).map(Number); const idle = all[3] + (all[4] || 0), total = all.slice(0, 8).reduce((a, b) => a + b, 0);
+  let engine = 0; if (pid) try { const f = fs.readFileSync('/proc/' + pid + '/stat', 'utf8').split(') ')[1].split(' '); engine = Number(f[11]) + Number(f[12]); } catch {}
+  return { total, busy: total - idle, engine };
+}
+const setQuota = (unit, percent) => new Promise(resolve => { const child = spawn('systemctl', ['--user', 'set-property', '--runtime', unit, 'CPUQuota=' + (percent ? Math.round(percent) + '%' : '')], { stdio: 'ignore', env: { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || '/run/user/' + process.getuid() } }); child.on('error', () => resolve(false)); child.on('close', code => resolve(code === 0)); });
+async function governor() {
+  // The package sensor jumps 20 °C between reads: decisions use a smoothed temperature.
+  const s = gov.settings, pid = enginePid(), now = cpuTimes(pid), prev = gov.last; gov.last = now; gov.rawTemp = cpuTemp(); gov.temp = gov.rawTemp == null ? null : gov.temp == null ? gov.rawTemp : gov.temp * 0.6 + gov.rawTemp * 0.4;
+  if (pid !== gov.pid) { gov.pid = pid; gov.applied = null; gov.quota = null; }
+  if (prev && now.total > prev.total) { const span = now.total - prev.total, eng = Math.max(0, now.engine - prev.engine); gov.engine = Math.round(eng / span * 100); gov.others = Math.max(0, Math.round((now.busy - prev.busy - eng) / span * 100)); gov.history.push(gov.others); if (gov.history.length > 120) gov.history.shift(); }
+  let unit = null; if (pid) try { unit = fs.readFileSync('/proc/' + pid + '/cgroup', 'utf8').match(/\/([^/\n]+\.scope)\s*$/m)?.[1] || null; } catch {}
+  // Percent of the whole machine (100 = every core); null = no limit.
+  let limit = null; const reasons = [];
+  if (s.enabled && running.job && unit && Date.now() - lastLive >= LIVE_HOLD) {
+    let q = 100;
+    const minutes = (Date.now() - (running.since || Date.now())) / 60000;
+    if (s.afterMinutes > 0 && minutes >= s.afterMinutes) { q = Math.min(q, s.capPercent); reasons.push(`há ${Math.floor(minutes)} min a gerar: limite de ${s.capPercent}%`); }
+    if (s.yieldOthers && gov.others != null && gov.others > 15) { const room = Math.max(10, 85 - gov.others); if (room < q) { q = room; reasons.push(`outras aplicações a usar ${gov.others}%`); } }
+    if (gov.temp != null) {
+      const prevQ = gov.quota ?? q;
+      if (gov.temp >= s.tempTarget + 8) { q = 10; reasons.push(`processador a ${Math.round(gov.temp)} °C: quase em pausa`); }
+      else if (gov.temp >= s.tempTarget) { q = Math.min(q, Math.max(10, prevQ * 0.8)); reasons.push(`processador a ${Math.round(gov.temp)} °C (alvo ${s.tempTarget} °C)`); }
+      else if (gov.temp > s.tempTarget - 4) { q = Math.min(q, prevQ); if (prevQ < 100) reasons.push(`processador a ${Math.round(gov.temp)} °C, perto do alvo`); }
+      else { q = Math.min(q, prevQ + 10); if (q < 100 && prevQ < 100 && !reasons.length) reasons.push(`a voltar ao normal depois de aquecer (${Math.round(gov.temp)} °C)`); } // cooled down: give back a little at a time
+    }
+    limit = q >= 100 ? null : Math.max(10, Math.round(q));
+  }
+  gov.quota = limit; gov.reasons = reasons;
+  if (unit && limit !== gov.applied) { if (await setQuota(unit, limit === null ? 0 : limit * CPUS)) gov.applied = limit; }
+}
+if (process.env.LECTORIA_GOVERNOR !== '0') setInterval(() => governor().catch(() => {}), 5000).unref(); // off in tests/QA: they must never throttle the real engine
+// "Power": how much of what the Lectoria could realistically take the engine is using. 100% = the whole processor minus
+// what essential background work always uses (the 20th percentile of other programs over the last 10 minutes).
+function power() {
+  const h = [...gov.history].sort((a, b) => a - b), floor = h.length ? h[Math.floor(h.length * 0.2)] : 0, room = Math.max(10, 100 - floor);
+  return { floor, power: gov.engine == null ? null : Math.min(100, Math.round(gov.engine / room * 100)), ceiling: gov.quota == null ? 100 : Math.min(100, Math.round(gov.quota / room * 100)) };
 }
 async function importKavita(session,chapter,series,title) {
   const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
@@ -650,6 +704,8 @@ async function handle(req,res) {
         if(exportMatch[2]&&req.method==='GET') return send(res,200,await exportDocx(session,doc),{'Content-Type':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(exportName(doc)),'Cache-Control':'no-store'});
         if(!exportMatch[2]&&req.method==='POST') { if(!EXPORTS) throw error(400,'Não há pasta de exportação configurada neste servidor.'); const file=path.join(EXPORTS,exportName(doc)); await fsp.mkdir(EXPORTS,{recursive:true}); await fsp.writeFile(file,await exportDocx(session,doc)); return send(res,200,{saved:file}); }
       }
+      if(route==='/api/governor'&&req.method==='GET') return send(res,200,{...power(),settings:gov.settings,temp:gov.temp==null?null:Math.round(gov.temp),others:gov.others,engine:gov.engine,limit:gov.quota,reasons:gov.reasons,running:Boolean(running.job),cpus:CPUS,engineFound:Boolean(gov.pid)});
+      if(route==='/api/governor'&&req.method==='PUT') { const i=await json(req,2000),n=(v,a,b,d)=>Number.isFinite(Number(v))?Math.min(b,Math.max(a,Math.round(Number(v)))):d; gov.settings={enabled:i.enabled!==false,afterMinutes:n(i.afterMinutes,0,1440,60),capPercent:n(i.capPercent,10,100,50),yieldOthers:i.yieldOthers!==false,tempTarget:n(i.tempTarget,60,95,80)}; await atomic(GOV_FILE,gov.settings); return send(res,200,gov.settings); }
       const leftMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/uncached$/);
       if(leftMatch&&req.method==='GET'){const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),leftMatch[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));return send(res,200,await uncached(doc,String(url.searchParams.get('voice')||''),Number(url.searchParams.get('rate'))||1));}
       const notesMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/notes(?:\/([A-Za-z0-9_-]{1,200}))?$/);

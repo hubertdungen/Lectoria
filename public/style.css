@@ -222,3 +222,42 @@ body.book-paged #book-frame{clip-path:inset(0 2px)}
 .job-chapters .jc-bar{grid-column:1/-1;height:3px;border-radius:2px;background:color-mix(in srgb,var(--text) 12%,transparent);overflow:hidden}
 .job-chapters .jc-bar span{display:block;height:100%;background:var(--accent)}
 .library-toolbar>label{min-width:0}.library-toolbar input,.library-toolbar select{max-width:100%;min-width:0;box-sizing:border-box}
+/* Engine power pill (player, Livro mode only) */
+.power-pill{display:inline-flex;align-items:center;gap:5px;margin-top:3px;font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums;letter-spacing:0}
+.power-pill[hidden],body.mode-reading .power-pill{display:none}
+.pp-track{position:relative;width:46px;height:4px;border-radius:2px;background:color-mix(in srgb,var(--text) 15%,transparent)}
+.pp-fill{position:absolute;inset:0 auto 0 0;border-radius:2px;background:var(--accent);transition:width .6s}
+.pp-cap{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--text);opacity:.7}
+.pp-cap[hidden]{display:none}
+/* "A processar agora" */
+.now-processing{border:1px solid var(--border);border-radius:16px;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 10%,var(--panel)),var(--panel));padding:18px 20px;margin-bottom:18px;display:grid;gap:14px}
+.now-processing[hidden]{display:none}
+.np-head{display:flex;gap:16px;align-items:center}
+.np-cover{width:64px;height:64px;object-fit:cover;border-radius:10px;flex-shrink:0}
+.np-titles{flex:1;min-width:0}
+.np-titles h2{margin:2px 0;font-size:20px;line-height:1.2}
+.np-titles p{margin:0;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.np-eyebrow{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--accent);font-weight:600}
+.np-big{text-align:right;flex-shrink:0}
+.np-big strong{display:block;font-size:40px;line-height:1;font-variant-numeric:tabular-nums;color:var(--accent)}
+.np-big span{font-size:11px;color:var(--muted)}
+.np-ticks{display:flex;gap:2px;height:8px}
+.np-tick{border-radius:2px;background:color-mix(in srgb,var(--text) 14%,transparent)}
+.np-tick.ready{background:var(--accent)}
+.np-tick.now{background:color-mix(in srgb,var(--accent) 45%,transparent);outline:1px solid var(--accent)}
+.np-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.np-tile{background:color-mix(in srgb,var(--text) 5%,transparent);border-radius:12px;padding:10px 12px;display:grid;gap:2px;align-content:start}
+.np-label{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted)}
+.np-value{font-size:22px;line-height:1.15;font-variant-numeric:tabular-nums}
+.np-value small{font-size:13px;color:var(--muted);font-weight:400}
+.np-sub{font-size:11px;color:var(--muted)}
+.np-hot .np-value{color:#e0a060}
+.np-gauge{position:relative;display:block;height:5px;border-radius:3px;background:color-mix(in srgb,var(--text) 14%,transparent);margin-top:4px}
+.np-gauge span{position:absolute;inset:0 auto 0 0;border-radius:3px;background:var(--accent);transition:width .6s}
+.np-gauge i{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--text);opacity:.7}
+.np-why{margin:0;font-size:12px;color:var(--muted)}
+@media(max-width:560px){.np-big strong{font-size:30px}.np-cover{width:48px;height:48px}.np-titles h2{font-size:16px}.np-grid{grid-template-columns:repeat(2,1fr)}}
+.player-info .power-pill{display:inline-flex;flex-direction:row;white-space:nowrap}
+.player-info .power-pill>*{display:inline-block;margin:0}
+.player-info .power-pill .pp-fill,.player-info .power-pill .pp-cap{display:block}
+body.mode-reading .player-info .power-pill,.player-info .power-pill[hidden],.player.mini .power-pill{display:none}
