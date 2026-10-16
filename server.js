@@ -291,6 +291,8 @@ async function listJobs(s) {
   return jobs.sort((a,b)=>b.created.localeCompare(a.created));
 }
 // Partial recording: how many passages of a document already sit in the disk cache for a voice and speed.
+// Characters of a document still to be made with a voice and speed (the rest is in the passage cache): what an estimate should count.
+async function uncached(doc,voice,rate){let chars=0,total=0;for(const section of doc.sections)for(const text of chunks(section.text)){total+=text.length;if(!await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false))chars+=text.length;}return {chars,total};}
 async function coverage(doc,voice,rate){let done=0,total=0;for(const section of doc.sections)for(const text of chunks(section.text)){total++;if(await fsp.access(cacheFile(voiceKey(text,voice,rate))).then(()=>true,()=>false))done++;}return {done,total};}
 async function autoCompile(s,docId,voice,rate){
   try{
@@ -313,7 +315,7 @@ async function createJob(s,input) {
   const twin=jobs.find(j=>j.title.trim().toLowerCase()===doc.title.trim().toLowerCase()&&j.voice===voice.id&&j.rate===rate&&['queued','running','cancelling','done'].includes(j.status)); if(twin&&!input.force) throw error(409,twin.status==='done'?'Já existe este áudio com esta voz e velocidade. Remove-o em Áudios se quiseres gerar outro.':'Este áudio já está na fila com esta voz e velocidade.');
   const total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { total.chunks++; total.chars+=c.length; }
   if(!total.chunks) throw error(400,'O documento não tem texto para ler.');
-  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},eta:Math.round(total.chars/speed(await stats(),voice.id)),...(input.auto?{auto:true}:{})};
+  const job={id:crypto.randomBytes(16).toString('hex'),user:hash(s.userId),doc:doc.id,title:doc.title,cover:doc.cover==='own'?'./api/documents/'+doc.id+'/cover':doc.cover||null,voice:voice.id,voiceName:voice.name,rate,destination:input.destination,status:'queued',created:new Date().toISOString(),startAt:new Date(startAt).toISOString(),total,done:{chunks:0,chars:0},todo:(await uncached(doc,voice.id,rate)).chars,eta:Math.round((await uncached(doc,voice.id,rate)).chars/speed(await stats(),voice.id)),...(input.auto?{auto:true}:{})};
   await atomic(path.join(jobsDir(s),job.id+'.json'),job); return job;
 }
 function pcm(wav) {
@@ -331,7 +333,7 @@ function wavHeader(bytes,rate,channels) { // ponytail: plain RIFF, so a single f
   const h=Buffer.alloc(44); h.write('RIFF',0); h.writeUInt32LE(36+bytes,4); h.write('WAVE',8); h.write('fmt ',12); h.writeUInt32LE(16,16); h.writeUInt16LE(1,20); h.writeUInt16LE(channels,22); h.writeUInt32LE(rate,24); h.writeUInt32LE(rate*channels*2,28); h.writeUInt16LE(channels*2,32); h.writeUInt16LE(16,34); h.write('data',36); h.writeUInt32LE(bytes,40); return h;
 }
 async function synthesizeChunk(text,voice,rate,key,signal) {
-  const cached=await readCache(voiceKey(text,voice,rate)); if(cached)return pcm(cached);
+  const cached=await readCache(voiceKey(text,voice,rate)); if(cached)return {...pcm(cached),cached:true};
   for(let attempt=0;;attempt++) {
     try {
       const response=await fetch(VOICE+'/api/voice',{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Bridge':key},body:JSON.stringify({text,voice,rate}),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(300000)]):AbortSignal.timeout(300000)});
@@ -347,7 +349,7 @@ async function jobChunk(job,text,key) {
     while(Date.now()-lastLive<LIVE_HOLD) { if(running.cancelled.has(job.id)) throw new Error('cancelled'); await sleep(Math.min(3000,LIVE_HOLD)); }
     if(running.cancelled.has(job.id)) throw new Error('cancelled');
     const controller=new AbortController(); running.inflight=controller;
-    try { return await synthesizeChunk(text,job.voice,job.rate,key,controller.signal); }
+    try { const t=Date.now(), audio=await synthesizeChunk(text,job.voice,job.rate,key,controller.signal); return {...audio,seconds:(Date.now()-t)/1000}; }
     catch(e) { if(!controller.signal.aborted) throw e; }
     finally { running.inflight=null; }
   }
@@ -355,6 +357,7 @@ async function jobChunk(job,text,key) {
 async function runJob(job,file) {
   const dir=path.dirname(file), base=path.join(dir,job.id), key=(await fsp.readFile(KEY,'utf8')).trim();
   let doc; try { doc=JSON.parse(await fsp.readFile(path.join(dir,'..',job.doc+'.json'),'utf8')); } catch { throw new Error('O documento já não está na estante.'); }
+  job.todo=(await uncached(doc,job.voice,job.rate)).chars;
   job.total={chunks:0,chars:0}; for(const section of doc.sections) for(const c of chunks(section.text)) { job.total.chunks++; job.total.chars+=c.length; } // the book may have changed since the job was queued
   await fsp.rm(base+'.pcm',{force:true}); const out=fs.createWriteStream(base+'.pcm',{mode:0o600});
   const write=buffer=>new Promise((resolve,reject)=>out.write(buffer,e=>e?reject(e):resolve()));
@@ -366,11 +369,12 @@ async function runJob(job,file) {
         // Live listening has priority over background jobs (jobChunk waits, and a live request interrupts it);
         // a job given priority takes the engine at the next passage — what is done stays in the cache.
         if(running.yieldTo&&running.yieldTo!==job.id) throw new Error('yield');
-        const started=Date.now(); const audio=await jobChunk(job,text,key);
+        const audio=await jobChunk(job,text,key);
         if(!rate) { rate=audio.rate; channels=audio.channels; } else if(audio.rate!==rate||audio.channels!==channels) throw new Error('synthesis-failed');
         await write(audio.data); await write(Buffer.alloc(Math.round(rate*0.4)*channels*2)); bytes+=audio.data.length+Math.round(rate*0.4)*channels*2;
-        const seconds=(Date.now()-started)/1000; st[job.voice]={chars:(st[job.voice]?.chars||0)+text.length,seconds:(st[job.voice]?.seconds||0)+seconds};
-        job.done.chunks++; job.done.chars+=text.length; job.eta=Math.round((job.total.chars-job.done.chars)/speed(st,job.voice)); job.speed=speed(st,job.voice);
+        // Only passages the engine really made count for the measured speed and for what is left (cache hits take no time).
+        if(!audio.cached) { st[job.voice]={chars:(st[job.voice]?.chars||0)+text.length,seconds:(st[job.voice]?.seconds||0)+audio.seconds}; job.todo=Math.max(0,(job.todo||0)-text.length); }
+        job.done.chunks++; job.done.chars+=text.length; job.eta=Math.round((job.todo||0)/speed(st,job.voice)); job.speed=speed(st,job.voice);
         await atomic(STATS,st); await atomic(file,job);
       }
       await write(Buffer.alloc(Math.round(rate*0.8)*channels*2)); bytes+=Math.round(rate*0.8)*channels*2;
@@ -560,7 +564,8 @@ async function handle(req,res) {
         // ?voice=&rate= adds the partial-recording coverage of every shelf document for that voice.
         const partial={};const voice=url.searchParams.get('voice'),rate=Number(url.searchParams.get('rate'));
         if(voice&&rate){const dir=userDir(session);for(const file of (await fsp.readdir(dir).catch(()=>[])).filter(x=>/^[a-f0-9]{32}\.json$/.test(x))){try{const d=JSON.parse(await fsp.readFile(path.join(dir,file),'utf8'));const c=await coverage(d,voice,rate);if(c.done)partial[d.id]={...c,title:d.title,cover:d.cover||null};}catch{}}}
-        return send(res,200,{jobs:await listJobs(session),speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD,partial});
+        const jobs=await listJobs(session);for(const j of jobs)if(j.status==='queued'){try{const d=JSON.parse(await fsp.readFile(path.join(userDir(session),j.doc+'.json'),'utf8'));j.todo=(await uncached(d,j.voice,j.rate)).chars;j.eta=Math.round(j.todo/speed(st,j.voice));}catch{}}
+        return send(res,200,{jobs,speeds,defaultSpeed:50,cloud:Boolean(CLOUD),cloudDir:CLOUD,partial});
       }
       if(route==='/api/jobs' && req.method==='POST')return send(res,201,await createJob(session,await json(req,4000)));
       const prioMatch=route.match(/^\/api\/jobs\/([a-f0-9]{32})\/priority$/);
@@ -641,6 +646,8 @@ async function handle(req,res) {
         if(exportMatch[2]&&req.method==='GET') return send(res,200,await exportDocx(session,doc),{'Content-Type':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(exportName(doc)),'Cache-Control':'no-store'});
         if(!exportMatch[2]&&req.method==='POST') { if(!EXPORTS) throw error(400,'Não há pasta de exportação configurada neste servidor.'); const file=path.join(EXPORTS,exportName(doc)); await fsp.mkdir(EXPORTS,{recursive:true}); await fsp.writeFile(file,await exportDocx(session,doc)); return send(res,200,{saved:file}); }
       }
+      const leftMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/uncached$/);
+      if(leftMatch&&req.method==='GET'){const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),leftMatch[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));return send(res,200,await uncached(doc,String(url.searchParams.get('voice')||''),Number(url.searchParams.get('rate'))||1));}
       const notesMatch=route.match(/^\/api\/documents\/([a-f0-9]{32})\/notes(?:\/([A-Za-z0-9_-]{1,200}))?$/);
       if(notesMatch) {
         const doc=JSON.parse(await fsp.readFile(path.join(userDir(session),notesMatch[1]+'.json'),'utf8').catch(()=>{throw error(404,'Documento não encontrado.');}));

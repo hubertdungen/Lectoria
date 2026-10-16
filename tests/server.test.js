@@ -161,3 +161,16 @@ test('live reading interrupts a full-audio passage, and a prioritised job takes 
   await tick(); assert.equal(await status(a), 'done');
   assert.equal((await fetch(base + `/api/jobs/${b}/priority`, { method: 'POST', headers, body: '{}' })).status, 409);
 });
+
+test('estimates count only passages not yet in the cache, and cache hits do not touch the measured speed', async () => {
+  const { tick } = served; const Cookie = await login('alice'), headers = { Cookie, 'Content-Type': 'application/json' };
+  const doc = (await (await fetch(base + '/api/documents', { method: 'POST', headers, body: JSON.stringify({ title: 'Cache e previsão', sections: [{ title: 'Um', text: 'Uma frase nova para a cache.\n\nOutra frase nova.' }] }) })).json()).id;
+  const left = async () => (await (await fetch(base + `/api/documents/${doc}/uncached?voice=pt_PT-tugao&rate=1`, { headers: { Cookie } })).json());
+  assert.deepEqual(await left(), { chars: 45, total: 45 });
+  const make = async () => (await (await fetch(base + '/api/jobs', { method: 'POST', headers, body: JSON.stringify({ doc, voice: 'pt_PT-tugao', rate: 1, destination: 'download', force: true }) })).json());
+  const first = await make(); assert.equal(first.todo, 45); await tick();
+  assert.equal((await left()).chars, 0);
+  const stats = () => JSON.parse(require('node:fs').readFileSync(path.join(temp, 'stats.json'), 'utf8'))['pt_PT-tugao'];
+  const before = stats(); const second = await make(); assert.equal(second.todo, 0); assert.equal(second.eta, 0);
+  await tick(); assert.deepEqual(stats(), before);
+});
