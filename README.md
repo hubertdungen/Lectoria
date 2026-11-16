@@ -51,4 +51,4 @@ npm test             # node:test and unittest, with Kavita and the voice engine 
 
 The interface is in European Portuguese.
 
-<p align="center"><a href="https://dlforge.dungenlabs.com"><img src="branding/dlforge-logo.svg" alt="DL Forge" width="120"></a></p>
+<p align="center"><a href="https://dlforge.dungenlabs.com"><picture><source media="(prefers-color-scheme: dark)" srcset="branding/dlforge-logo-negative.svg"><source media="(prefers-color-scheme: light)" srcset="branding/dlforge-logo.svg"><img src="branding/dlforge-logo.svg" alt="DL Forge" width="120"></picture></a></p>
