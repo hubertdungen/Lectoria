@@ -261,3 +261,7 @@ body.book-paged #book-frame{clip-path:inset(0 2px)}
 .player-info .power-pill>*{display:inline-block;margin:0}
 .player-info .power-pill .pp-fill,.player-info .power-pill .pp-cap{display:block}
 body.mode-reading .player-info .power-pill,.player-info .power-pill[hidden],.player.mini .power-pill{display:none}
+
+/* Division attribution uses external CSS to respect the app Content Security Policy. */
+.forge-brand{display:inline-flex;align-items:center;justify-content:center;gap:8px;color:inherit;text-decoration:none;font-size:12px}.forge-brand svg{width:76px;height:36px;flex:none}
+.page-footer{flex-wrap:wrap;gap:12px}
