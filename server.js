@@ -7,11 +7,12 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const DATA = process.env.LECTORIA_DATA || path.join(__dirname, 'data');
-const KAVITA = process.env.LECTORIA_KAVITA_URL || 'http://127.0.0.1:5000';
-const VOICE = process.env.LECTORIA_VOICE_URL || 'http://127.0.0.1:8103';
+// Kavita and the neural voice engine (BlogArtifex' bridge) are optional: set a variable to an empty string to switch it off on purpose.
+const KAVITA = (process.env.LECTORIA_KAVITA_URL ?? 'http://127.0.0.1:5000').trim().replace(/\/+$/, '');
+const VOICE = (process.env.LECTORIA_VOICE_URL ?? 'http://127.0.0.1:8103').trim().replace(/\/+$/, '');
 const KEY = process.env.LECTORIA_VOICE_KEY_FILE || path.join(DATA, 'voice-bridge.key');
 // Blogs the reader may import from (public Blogger feeds); an allowlist so the server never fetches arbitrary URLs.
-const BLOGS = (process.env.LECTORIA_BLOGS ?? 'https://ocosmosracional.blogspot.com,https://therationalcosmos.blogspot.com').split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
+const BLOGS = (process.env.LECTORIA_BLOGS ?? '').split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const CLOUD = process.env.LECTORIA_CLOUD_DIR || '';
 const EXPORTS = process.env.LECTORIA_EXPORT_DIR || ''; // Word exports saved on the server (shared folder)
 const PYTHON = process.env.LECTORIA_PYTHON ?? 'python3';
@@ -43,7 +44,7 @@ let lastLive = 0; const running = { job: null, cancelled: new Set(), inflight: n
 const sessions = new Map(), attempts = new Map();
 // Sessions outlive restarts: they are written to disk (0600) whenever they change.
 const SESSIONS = path.join(DATA, 'sessions.json');
-try { for (const [id, s] of Object.entries(JSON.parse(fs.readFileSync(SESSIONS, 'utf8')))) if (/^[a-f0-9]{64}$/.test(id) && s.expires > Date.now() && s.apiKey) sessions.set(id, s); } catch {} // sessions without the Kavita api key predate cover support: one fresh login fixes them
+try { for (const [id, s] of Object.entries(JSON.parse(fs.readFileSync(SESSIONS, 'utf8')))) if (/^[a-f0-9]{64}$/.test(id) && s.expires > Date.now() && (s.apiKey || s.local)) sessions.set(id, s); } catch {} // sessions without the Kavita api key predate cover support: one fresh login fixes them
 let sessionTimer; const saveSessions = () => { clearTimeout(sessionTimer); sessionTimer = setTimeout(() => atomic(SESSIONS, Object.fromEntries(sessions)).catch(() => {}), 500); sessionTimer.unref(); };
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const error = (status, message) => Object.assign(new Error(message), { status });
@@ -63,6 +64,7 @@ async function json(req, limit = 6_000_000) {
   catch (e) { if (e.status) throw e; throw error(400, 'Pedido inválido.'); }
 }
 async function kavita(route, session, options = {}) {
+  if (!KAVITA) throw error(503, 'O Kavita não está ligado a esta instalação.');
   const response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: options.signal || AbortSignal.timeout(120000) });
   if (!response.ok) { const detail = await response.text().catch(() => ''); throw error(response.status === 401 || response.status === 403 ? 401 : 502, response.status === 401 || response.status === 403 ? 'Volta a entrar no Kavita para continuar.' : /input\/output|not found|no such file/i.test(detail) ? 'O Kavita não consegue ler o ficheiro deste livro no disco (erro de disco ou ficheiro em falta). Verifica a montagem do disco de media.' : 'O Kavita não conseguiu responder a este pedido.'); }
   return response;
@@ -73,6 +75,21 @@ function auth(req) {
   if (!session || session.expires < Date.now()) throw error(401, 'Entra com a tua conta do Kavita.');
   return session;
 }
+// Capability sensor: what is configured (env) and what answers right now (short probe, cached), so the UI shows only what works.
+async function probe(url, route, ok = () => true) {
+  if (!url) return false;
+  try { const r = await fetch(url + route, { signal: AbortSignal.timeout(1500) }); return r.ok && ok(await r.json().catch(() => ({}))); } catch { return false; }
+}
+let capCache = null;
+async function capabilities() {
+  if (capCache && capCache.until > Date.now()) return capCache.value;
+  const [kavitaUp, voiceUp] = await Promise.all([probe(KAVITA, '/api/health', () => true), probe(VOICE, '/api/voice/status', j => j.available !== false)]);
+  const value = { kavita: { configured: Boolean(KAVITA), available: kavitaUp }, voice: { configured: Boolean(VOICE), available: voiceUp, engine: voiceUp ? 'host' : 'browser' }, blogs: { configured: BLOGS.length > 0, available: BLOGS.length > 0 }, login: KAVITA ? 'kavita' : 'local', checkedAt: new Date().toISOString() };
+  capCache = { value, until: Date.now() + ((!KAVITA || kavitaUp) && (!VOICE || voiceUp) ? 30000 : 10000) }; // a failed probe is retried sooner
+  return value;
+}
+// Voices that run in the browser (no engine on the server needed); the ids match local-worker.js.
+const BROWSER_VOICES = [{ id: 'pt_PT-tugao', name: 'Tugão · Português de Portugal (no navegador)', lang: 'pt-PT' }, { id: 'af_heart', name: 'Heart · English (browser)', lang: 'en-US' }, { id: 'am_michael', name: 'Michael · English (browser)', lang: 'en-US' }];
 const userDir = s => path.join(DATA, 'users', hash(s.userId));
 async function atomic(file, value) { await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 }); const temp = file + '.' + crypto.randomUUID(); await fsp.writeFile(temp, JSON.stringify(value), { mode: 0o600 }); await fsp.rename(temp, file); }
 function validateDoc(doc) {
@@ -463,7 +480,7 @@ async function governor() {
   gov.quota = limit; gov.reasons = reasons;
   if (unit && limit !== gov.applied) { if (await setQuota(unit, limit === null ? 0 : limit * CPUS)) gov.applied = limit; }
 }
-if (process.env.LECTORIA_GOVERNOR !== '0') setInterval(() => governor().catch(() => {}), 5000).unref(); // off in tests/QA: they must never throttle the real engine
+if (VOICE && process.env.LECTORIA_GOVERNOR !== '0') setInterval(() => governor().catch(() => {}), 5000).unref(); // off in tests/QA: they must never throttle the real engine
 // "Power": how much of what the Lectoria could realistically take the engine is using. 100% = the whole processor minus
 // what essential background work always uses (the 20th percentile of other programs over the last 10 minutes).
 function power() {
@@ -523,11 +540,18 @@ async function handle(req,res) {
     let route = url.pathname.replace(/^\/lectoria(?=\/|$)/,'') || '/';
     if (!['GET','HEAD'].includes(req.method)) sameOrigin(req);
     if (route === '/api/health') return send(res,200,{ok:true,version:'1.1.0'});
+    if (route === '/api/capabilities' && req.method === 'GET') return send(res,200,await capabilities());
     if (route === '/api/login' && req.method === 'POST') {
       const ip=req.socket.remoteAddress; const recent=attempts.get(ip)||{count:0,until:Date.now()+60000};
       if (recent.until < Date.now()) { recent.count=0;recent.until=Date.now()+60000; }
       if (++recent.count > 30) throw error(429,'Demasiadas tentativas. Aguarda um minuto.'); attempts.set(ip,recent);
       const input=await json(req,4000);
+      if (input.local === true) { // single-user mode, only when Kavita is switched off on purpose (never as a fallback to an outage: that would bypass its login)
+        if (KAVITA) throw error(403,'Este servidor pede a conta do Kavita.');
+        const sid=crypto.randomBytes(32).toString('hex'), expires=Date.now()+30*86400000; sessions.set(sid,{userId:'local',username:'local',token:'',apiKey:'',local:true,expires}); saveSessions();
+        const secure=req.headers['x-forwarded-proto']==='https' || req.socket.encrypted;
+        return send(res,200,{username:'local'},{'Set-Cookie':`lectoria_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${secure?'; Secure':''}`});
+      }
       if (typeof input.apiKey !== 'string' && (typeof input.username !== 'string' || typeof input.password !== 'string')) throw error(400,'Preenche os dados de acesso.');
       const result=await (await (input.apiKey ? kavita('/api/Plugin/authenticate?apiKey='+encodeURIComponent(input.apiKey)+'&pluginName=Lectoria',null,{method:'POST'}) : kavita('/api/Account/login',null,{method:'POST',body:JSON.stringify({username:input.username,password:input.password})}))).json();
       if (!result.token || result.id == null) throw error(401,'O Kavita não devolveu uma sessão válida.');
@@ -545,7 +569,11 @@ async function handle(req,res) {
     if (route.startsWith('/api/')) {
       const session=auth(req);
       if(route==='/api/session' && req.method==='GET')return send(res,200,{username:session.username});
-      if(route==='/api/voices' && req.method==='GET')return send(res,200,await(await fetch(VOICE+'/api/voice/status',{signal:AbortSignal.timeout(5000)})).json());
+      if(route==='/api/voices' && req.method==='GET'){ // without the engine the browser voices are offered, never an error
+        try{if(!VOICE)throw 0;const data=await(await fetch(VOICE+'/api/voice/status',{signal:AbortSignal.timeout(5000)})).json();if(data.available!==false&&Array.isArray(data.voices))return send(res,200,data);}catch{}
+        return send(res,200,{available:false,voices:BROWSER_VOICES});
+      }
+      if(!VOICE&&((route==='/api/voice'&&req.method==='POST')||(route==='/api/jobs'&&req.method==='POST')))throw error(503,'O motor de voz não está ligado a esta instalação.');
       if(route==='/api/voice/cached' && req.method==='POST') {
         const input=await json(req,400000);if(!Array.isArray(input.texts)||input.texts.length>1000||input.texts.some(t=>typeof t!=='string'))throw error(400,'Pedido inválido.');
         return send(res,200,{cached:await Promise.all(input.texts.map(t=>fsp.access(cacheFile(voiceKey(t,String(input.voice),Number(input.rate)))).then(()=>true,()=>false)))});
