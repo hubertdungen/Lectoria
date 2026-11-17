@@ -65,7 +65,12 @@ async function json(req, limit = 6_000_000) {
 }
 async function kavita(route, session, options = {}) {
   if (!KAVITA) throw error(503, 'O Kavita não está ligado a esta instalação.');
-  const response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: options.signal || AbortSignal.timeout(120000) });
+  let response;
+  try {
+    response = await fetch(KAVITA + route, { ...options, headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}), ...options.headers }, signal: options.signal || AbortSignal.timeout(15000) });
+  } catch {
+    throw error(502, 'O Kavita está indisponível de momento ou demorou demasiado tempo a responder. Tenta novamente mais tarde.');
+  }
   if (!response.ok) { const detail = await response.text().catch(() => ''); throw error(response.status === 401 || response.status === 403 ? 401 : 502, response.status === 401 || response.status === 403 ? 'Volta a entrar no Kavita para continuar.' : /input\/output|not found|no such file/i.test(detail) ? 'O Kavita não consegue ler o ficheiro deste livro no disco (erro de disco ou ficheiro em falta). Verifica a montagem do disco de media.' : 'O Kavita não conseguiu responder a este pedido.'); }
   return response;
 }
@@ -488,7 +493,7 @@ function power() {
   return { floor, power: gov.engine == null ? null : Math.min(100, Math.round(gov.engine / room * 100)), ceiling: gov.quota == null ? 100 : Math.min(100, Math.round(gov.quota / room * 100)) };
 }
 async function importKavita(session,chapter,series,title) {
-  const response=await kavita('/api/Download/chapter?chapterId='+chapter,session);
+  const response=await kavita('/api/Download/chapter?chapterId='+chapter,session,{signal:AbortSignal.timeout(120000)});
   const filename=response.headers.get('content-disposition')?.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)?.[1]||'book.zip';
   const raw=await boundedResponse(response,MAX_UPLOAD);const doc=await extract(raw,decodeURIComponent(filename));kavitaIds.delete(chapter);
   if(title)doc.title=String(title).slice(0,300); doc.source='Kavita'; doc.origin={kind:'kavita',chapter,series}; const cover=await kavitaCover(session,series); if(cover)doc.cover='own'; const saved=await saveDoc(session,doc); if(cover)await storeCover(session,saved.id,cover); return saved;
