@@ -30,6 +30,8 @@ test('only Kavita configured but down: shown as unavailable, and never a way aro
   const caps=(await J(base,'/api/capabilities')).body;assert.deepEqual([caps.kavita.configured,caps.kavita.available,caps.login],[true,false,'kavita']);
   assert.equal((await J(base,'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"local":true}'})).status,403);
   assert.equal((await J(base,'/api/documents')).status,401);
+  const login=await J(base,'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"username":"a","password":"b"}'});
+  assert.equal(login.status,502);assert.match(login.body.error,/Kavita está indisponível/);
 });
 test('only the voice engine up (Kavita off): host voices, local login',async()=>{
   const base=await run({LECTORIA_KAVITA_URL:'',LECTORIA_VOICE_URL:up()});
@@ -44,4 +46,13 @@ test('voice engine configured but dead: browser voices, no error',async()=>{
 test('both up: Kavita login, host voices',async()=>{
   const base=await run({LECTORIA_KAVITA_URL:up(),LECTORIA_VOICE_URL:up(),LECTORIA_BLOGS:'https://example.blogspot.com'});
   const caps=(await J(base,'/api/capabilities')).body;assert.deepEqual([caps.kavita.available,caps.voice.available,caps.blogs.configured,caps.login],[true,true,true,'kavita']);
+});
+
+test('unresponsive Kavita login returns a readable 502 within 15 seconds',async()=>{
+  const hanging=http.createServer(()=>{});await new Promise(r=>hanging.listen(0,'127.0.0.1',r));
+  try {
+    const base=await run({LECTORIA_KAVITA_URL:'http://127.0.0.1:'+hanging.address().port,LECTORIA_VOICE_URL:''});
+    const start=Date.now(),login=await J(base,'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"username":"a","password":"b"}'});
+    assert.equal(login.status,502);assert.match(login.body.error,/demorou demasiado tempo/);assert.ok(Date.now()-start<18000);
+  } finally {hanging.closeAllConnections();hanging.close();}
 });
