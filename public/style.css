@@ -278,3 +278,10 @@ body.mode-reading .player-info .power-pill,.player-info .power-pill[hidden],.pla
 }
 @keyframes fgd{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
 @media (prefers-reduced-motion:reduce){.forge-link:hover .fgm *{animation:none}}
+
+/* Optional backends (capability sensor): hidden when not configured, marked when configured but not answering. */
+body[data-cap-kavita="0"] [data-view="kavita"],body[data-cap-kavita="0"] #source-kavita,body[data-cap-kavita="0"] #open-library,body[data-cap-kavita="0"] #kavita-reading-block,body[data-cap-kavita="0"] #kavita-view,
+body[data-cap-blogs="0"] [data-view="blogs"],body[data-cap-blogs="0"] #source-blogs,body[data-cap-blogs="0"] #blogs-view,
+body:not([data-cap-voice="1"]) [data-view="audio"],body:not([data-cap-voice="1"]) #audio-view,
+body[data-login="local"] #account{display:none!important}
+body[data-cap-kavita="down"] [data-view="kavita"]::after{content:" · indisponível de momento";font-size:.8em;opacity:.7}
